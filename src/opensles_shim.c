@@ -77,7 +77,6 @@ typedef struct {
   volatile uint32_t queued_tail_index;
   volatile uint32_t queued_count;
   volatile uint32_t queued_front_offset;
-  volatile uint32_t play_index;
   uint32_t queue_capacity;
 
   slBufferQueueCallback callback;
@@ -129,7 +128,6 @@ static void queue_reset(AudioPlayer *p) {
   p->queued_tail_index = 0;
   p->queued_count = 0;
   p->queued_front_offset = 0;
-  p->play_index = 0;
 }
 
 static void queue_push(AudioPlayer *p, uint32_t size) {
@@ -166,7 +164,6 @@ static void queue_consume(AudioPlayer *p, uint32_t bytes) {
     p->queued_head_index++;
     p->queued_count--;
     p->queued_front_offset = 0;
-    p->play_index++;
   }
 }
 
@@ -293,8 +290,20 @@ static void sdl_audio_callback(void *userdata, Uint8 *stream, int len) {
     }
   }
 
+  int32_t max_abs = 0;
   for (int s = 0; s < out_samples; s++) {
     int32_t v = mix_buf[s];
+    int32_t abs_v = (v < 0) ? -v : v;
+    if (abs_v > max_abs) max_abs = abs_v;
+  }
+
+  float limiter = 1.0f;
+  if (max_abs > 32767) {
+    limiter = 32767.0f / (float)max_abs;
+  }
+
+  for (int s = 0; s < out_samples; s++) {
+    int32_t v = (int32_t)(mix_buf[s] * limiter);
     if (v > 32767) v = 32767;
     if (v < -32768) v = -32768;
     out[s] = (int16_t)v;
@@ -356,9 +365,7 @@ static SLresult play_SetPlayState(void *self, SLuint32 state) {
       AudioPlayer *p = &g_players[i];
       debugPrintf("opensles_shim: player %d SetPlayState(%u -> %u)\n",
                   i, p->play_state, state);
-      if (state == SL_PLAYSTATE_PLAYING && p->play_state != SL_PLAYSTATE_PLAYING) {
-        p->enqueue_counter = 0;
-        p->ever_enqueued = 0;
+      if (state == SL_PLAYSTATE_STOPPED && p->play_state != SL_PLAYSTATE_STOPPED) {
         p->headatend_fired = 0;
         p->decoder_done = 0;
       }
@@ -498,8 +505,13 @@ static SLresult bq_GetState(void *self, void *pState) {
       AudioPlayer *p = &g_players[i];
       if (pState) {
         SLuint32 *state = (SLuint32 *)pState;
+        uint32_t play_index = 0;
+        uint32_t capacity = p->queue_capacity ? p->queue_capacity : 1;
+        if (p->queued_count > 0) {
+          play_index = p->queued_head_index % capacity;
+        }
         state[0] = p->queued_count;
-        state[1] = p->play_index;
+        state[1] = play_index;
       }
       return SL_RESULT_SUCCESS;
     }
@@ -792,34 +804,10 @@ void opensles_shim_pump_callbacks(void) {
       }
     }
 
-    if (!p->callback && p->play_callback && readable <= callback_threshold) {
-      uint32_t counter_before = p->enqueue_counter;
-
-      if ((p->play_event_mask & SL_PLAYEVENT_HEADATNEWPOS) != 0) {
-        if (p->debug_play_callback_logs < 16 || counter_before % 64 == 0) {
-          //debugPrintf("opensles_shim: player %d play-fallback HEADATNEWPOS readable=%u threshold=%u counter=%u\n",
-          //            i, readable, callback_threshold, counter_before);
-          p->debug_play_callback_logs++;
-        }
-        p->play_callback(&p->play_ptr, p->play_callback_context, SL_PLAYEVENT_HEADATNEWPOS);
-      }
-
-      if (p->enqueue_counter == counter_before &&
-          (p->play_event_mask & SL_PLAYEVENT_HEADMOVING) != 0) {
-        if (p->debug_play_callback_logs < 16 || counter_before % 64 == 0) {
-          //debugPrintf("opensles_shim: player %d play-fallback HEADMOVING readable=%u threshold=%u counter=%u\n",
-          //            i, readable, callback_threshold, counter_before);
-          p->debug_play_callback_logs++;
-        }
-        p->play_callback(&p->play_ptr, p->play_callback_context, SL_PLAYEVENT_HEADMOVING);
-      }
-
-      if (p->ever_enqueued && !p->decoder_done &&
-          p->enqueue_counter == counter_before) {
-        p->decoder_done = 1;
-        debugPrintf("opensles_shim: player %d decoder_done after play-fallback readable=%u counter=%u\n",
-                    i, ring_readable(p), p->enqueue_counter);
-      }
+    if (!p->callback && p->ever_enqueued && !p->decoder_done &&
+        p->queued_count == 0 && readable == 0) {
+      p->decoder_done = 1;
+      debugPrintf("opensles_shim: player %d decoder_done after queue drain\n", i);
     }
 
     // HEADATEND: fire play callback when decoder done and ring drained
@@ -830,6 +818,8 @@ void opensles_shim_pump_callbacks(void) {
           p->play_callback(&p->play_ptr, p->play_callback_context, SL_PLAYEVENT_HEADATEND);
           debugPrintf("opensles_shim: player %d HEADATEND fired\n", i);
         }
+        p->play_state = SL_PLAYSTATE_STOPPED;
+        queue_reset(p);
       }
     }
   }
