@@ -13,10 +13,11 @@
 #include <time.h>
 
 #include "opensles_shim.h"
+#include "so_util.h"
 #include "util.h"
 
 #define MAX_PLAYERS 16
-#define RING_BUFFER_SIZE (256 * 1024)
+#define RING_BUFFER_SIZE (4 * 1024 * 1024)
 #define RING_BUFFER_MASK (RING_BUFFER_SIZE - 1)
 #define SDL_AUDIO_SAMPLES 4096
 
@@ -71,6 +72,14 @@ typedef struct {
   volatile uint32_t ring_head;
   volatile uint32_t ring_tail;
 
+  uint32_t queued_sizes[64];
+  volatile uint32_t queued_head_index;
+  volatile uint32_t queued_tail_index;
+  volatile uint32_t queued_count;
+  volatile uint32_t queued_front_offset;
+  volatile uint32_t play_index;
+  uint32_t queue_capacity;
+
   slBufferQueueCallback callback;
   void *callback_context;
 
@@ -82,6 +91,9 @@ typedef struct {
   SLuint32 play_event_mask;
 
   uint32_t enqueue_counter;
+  uint32_t debug_enqueue_logs;
+  uint32_t debug_callback_logs;
+  uint32_t debug_play_callback_logs;
   int ever_enqueued;
   int headatend_fired;
   int decoder_done;
@@ -110,6 +122,53 @@ static AudioPlayer g_players[MAX_PLAYERS];
 static pthread_mutex_t g_players_lock = PTHREAD_MUTEX_INITIALIZER;
 static SDL_AudioDeviceID g_audio_dev = 0;
 static int g_audio_initialized = 0;
+
+static void queue_reset(AudioPlayer *p) {
+  memset(p->queued_sizes, 0, sizeof(p->queued_sizes));
+  p->queued_head_index = 0;
+  p->queued_tail_index = 0;
+  p->queued_count = 0;
+  p->queued_front_offset = 0;
+  p->play_index = 0;
+}
+
+static void queue_push(AudioPlayer *p, uint32_t size) {
+  if (size == 0) return;
+
+  if (p->queued_count >= (sizeof(p->queued_sizes) / sizeof(p->queued_sizes[0]))) {
+    uint32_t tail = (p->queued_tail_index - 1) %
+                    (sizeof(p->queued_sizes) / sizeof(p->queued_sizes[0]));
+    p->queued_sizes[tail] += size;
+    return;
+  }
+
+  uint32_t tail = p->queued_tail_index %
+                  (sizeof(p->queued_sizes) / sizeof(p->queued_sizes[0]));
+  p->queued_sizes[tail] = size;
+  p->queued_tail_index++;
+  p->queued_count++;
+}
+
+static void queue_consume(AudioPlayer *p, uint32_t bytes) {
+  while (bytes > 0 && p->queued_count > 0) {
+    uint32_t head = p->queued_head_index %
+                    (sizeof(p->queued_sizes) / sizeof(p->queued_sizes[0]));
+    uint32_t queued = p->queued_sizes[head];
+    uint32_t remaining = queued - p->queued_front_offset;
+
+    if (bytes < remaining) {
+      p->queued_front_offset += bytes;
+      return;
+    }
+
+    bytes -= remaining;
+    p->queued_sizes[head] = 0;
+    p->queued_head_index++;
+    p->queued_count--;
+    p->queued_front_offset = 0;
+    p->play_index++;
+  }
+}
 
 /* Ring buffer helpers */
 static inline uint32_t ring_readable(const AudioPlayer *p) {
@@ -198,6 +257,7 @@ static void sdl_audio_callback(void *userdata, Uint8 *stream, int len) {
     got = (got / frame_size) * frame_size;
     uint32_t src_frames_got = got / frame_size;
     if (src_frames_got == 0) continue;
+    queue_consume(p, got);
 
     if (src_rate == SDL_OUTPUT_RATE && src_channels == 2) {
       uint32_t n = src_frames_got;
@@ -277,6 +337,7 @@ static AudioPlayer *alloc_player(void) {
       p->active = 1;
       p->volume = 1.0f;
       p->play_state = SL_PLAYSTATE_STOPPED;
+      queue_reset(p);
       pthread_mutex_unlock(&g_players_lock);
       debugPrintf("opensles_shim: allocated player %d\n", i);
       return p;
@@ -293,6 +354,8 @@ static SLresult play_SetPlayState(void *self, SLuint32 state) {
   for (int i = 0; i < MAX_PLAYERS; i++) {
     if (&g_players[i].play_ptr == itf_ptr) {
       AudioPlayer *p = &g_players[i];
+      debugPrintf("opensles_shim: player %d SetPlayState(%u -> %u)\n",
+                  i, p->play_state, state);
       if (state == SL_PLAYSTATE_PLAYING && p->play_state != SL_PLAYSTATE_PLAYING) {
         p->enqueue_counter = 0;
         p->ever_enqueued = 0;
@@ -322,8 +385,17 @@ static SLresult play_RegisterCallback(void *self, void *callback, void *ctx) {
   void **itf_ptr = (void **)self;
   for (int i = 0; i < MAX_PLAYERS; i++) {
     if (&g_players[i].play_ptr == itf_ptr) {
+      uintptr_t ra = (uintptr_t)__builtin_return_address(0);
       g_players[i].play_callback = (void (*)(void *, void *, SLuint32))callback;
       g_players[i].play_callback_context = ctx;
+      if (text_base && ra >= (uintptr_t)text_base &&
+          ra < (uintptr_t)text_base + text_size) {
+        debugPrintf("opensles_shim: player %d play callback registered=%p ctx=%p caller=libTTapp.so+0x%lx\n",
+                    i, callback, ctx, (unsigned long)(ra - (uintptr_t)text_base));
+      } else {
+        debugPrintf("opensles_shim: player %d play callback registered=%p ctx=%p caller=%p\n",
+                    i, callback, ctx, (void *)ra);
+      }
       return SL_RESULT_SUCCESS;
     }
   }
@@ -335,6 +407,7 @@ static SLresult play_SetCallbackEventsMask(void *self, SLuint32 eventFlags) {
   for (int i = 0; i < MAX_PLAYERS; i++) {
     if (&g_players[i].play_ptr == itf_ptr) {
       g_players[i].play_event_mask = eventFlags;
+      debugPrintf("opensles_shim: player %d play event mask=0x%x\n", i, eventFlags);
       return SL_RESULT_SUCCESS;
     }
   }
@@ -376,11 +449,22 @@ static SLresult bq_Enqueue(void *self, const void *pBuffer, SLuint32 size) {
     if (&g_players[i].bq_ptr == itf_ptr) {
       AudioPlayer *p = &g_players[i];
       uint32_t written = ring_write(p, pBuffer, size);
-      (void)written;
-      p->enqueued_since_cb += size;
-      if (size > 0) p->last_enqueue_size = size;
-      p->enqueue_counter++;
-      p->ever_enqueued = 1;
+      if (written != size) {
+        debugPrintf("opensles_shim: WARNING: truncated enqueue for player %d (%u/%u bytes)\n",
+                    i, written, size);
+      }
+      queue_push(p, written);
+      p->enqueued_since_cb += written;
+      if (written > 0) {
+        p->last_enqueue_size = written;
+        p->enqueue_counter++;
+        p->ever_enqueued = 1;
+        if (p->debug_enqueue_logs < 16 || p->enqueue_counter % 64 == 0) {
+          debugPrintf("opensles_shim: player %d enqueue size=%u written=%u readable=%u counter=%u\n",
+                      i, size, written, ring_readable(p), p->enqueue_counter);
+          p->debug_enqueue_logs++;
+        }
+      }
       return SL_RESULT_SUCCESS;
     }
   }
@@ -392,8 +476,10 @@ static SLresult bq_Clear(void *self) {
   for (int i = 0; i < MAX_PLAYERS; i++) {
     if (&g_players[i].bq_ptr == itf_ptr) {
       AudioPlayer *p = &g_players[i];
+      debugPrintf("opensles_shim: player %d BufferQueue Clear\n", i);
       p->ring_head = 0;
       p->ring_tail = 0;
+      queue_reset(p);
       p->enqueued_since_cb = 0;
       p->enqueue_counter = 0;
       p->ever_enqueued = 0;
@@ -406,11 +492,17 @@ static SLresult bq_Clear(void *self) {
 }
 
 static SLresult bq_GetState(void *self, void *pState) {
-  (void)self;
-  if (pState) {
-    SLuint32 *state = (SLuint32 *)pState;
-    state[0] = 0;
-    state[1] = 0;
+  void **itf_ptr = (void **)self;
+  for (int i = 0; i < MAX_PLAYERS; i++) {
+    if (&g_players[i].bq_ptr == itf_ptr) {
+      AudioPlayer *p = &g_players[i];
+      if (pState) {
+        SLuint32 *state = (SLuint32 *)pState;
+        state[0] = p->queued_count;
+        state[1] = p->play_index;
+      }
+      return SL_RESULT_SUCCESS;
+    }
   }
   return SL_RESULT_SUCCESS;
 }
@@ -420,12 +512,32 @@ static SLresult bq_RegisterCallback(void *self, slBufferQueueCallback callback, 
   for (int i = 0; i < MAX_PLAYERS; i++) {
     if (&g_players[i].bq_ptr == itf_ptr) {
       AudioPlayer *p = &g_players[i];
+      uintptr_t ra = (uintptr_t)__builtin_return_address(0);
       p->callback = callback;
       p->callback_context = pContext;
+      if (text_base && ra >= (uintptr_t)text_base &&
+          ra < (uintptr_t)text_base + text_size) {
+        debugPrintf("opensles_shim: player %d buffer callback registered=%p ctx=%p caller=libTTapp.so+0x%lx\n",
+                    i, callback, pContext, (unsigned long)(ra - (uintptr_t)text_base));
+      } else {
+        debugPrintf("opensles_shim: player %d buffer callback registered=%p ctx=%p caller=%p\n",
+                    i, callback, pContext, (void *)ra);
+      }
       return SL_RESULT_SUCCESS;
     }
   }
   return SL_RESULT_SUCCESS;
+}
+
+static SLresult bq_GetState_or_RegisterCallback(void *self, void *arg1, void *arg2) {
+  uintptr_t maybe_callback = (uintptr_t)arg1;
+  uintptr_t text = (uintptr_t)text_base;
+
+  if (text_base && maybe_callback >= text && maybe_callback < text + text_size) {
+    return bq_RegisterCallback(self, (slBufferQueueCallback)arg1, arg2);
+  }
+
+  return bq_GetState(self, arg1);
 }
 
 /* Stub for unused interfaces */
@@ -442,11 +554,22 @@ static SLresult player_GetInterface(void *self, SLInterfaceID iid, void **pInter
   for (int i = 0; i < MAX_PLAYERS; i++) {
     if (&g_players[i].obj_ptr == obj_ptr) {
       AudioPlayer *p = &g_players[i];
-      if (iid == sl_IID_PLAY) *pInterface = &p->play_ptr;
-      else if (iid == sl_IID_VOLUME) *pInterface = &p->volume_ptr;
-      else if (iid == sl_IID_BUFFERQUEUE) *pInterface = &p->bq_ptr;
-      else if (iid == sl_IID_EFFECTSEND) *pInterface = &p->effectsend_ptr;
-      else *pInterface = &p->effectsend_ptr;
+      if (iid == sl_IID_PLAY) {
+        debugPrintf("opensles_shim: player %d GetInterface(PLAY)\n", i);
+        *pInterface = &p->play_ptr;
+      } else if (iid == sl_IID_VOLUME) {
+        debugPrintf("opensles_shim: player %d GetInterface(VOLUME)\n", i);
+        *pInterface = &p->volume_ptr;
+      } else if (iid == sl_IID_BUFFERQUEUE) {
+        debugPrintf("opensles_shim: player %d GetInterface(BUFFERQUEUE)\n", i);
+        *pInterface = &p->bq_ptr;
+      } else if (iid == sl_IID_EFFECTSEND) {
+        debugPrintf("opensles_shim: player %d GetInterface(EFFECTSEND)\n", i);
+        *pInterface = &p->effectsend_ptr;
+      } else {
+        debugPrintf("opensles_shim: player %d GetInterface(unknown=%p)\n", i, iid);
+        *pInterface = &p->effectsend_ptr;
+      }
       return SL_RESULT_SUCCESS;
     }
   }
@@ -490,7 +613,7 @@ static void setup_player_vtables(AudioPlayer *p) {
   for (int i = 0; i < 8; i++) p->bq_vtable[i] = (void *)stub_success;
   p->bq_vtable[0] = (void *)bq_Enqueue;
   p->bq_vtable[1] = (void *)bq_Clear;
-  p->bq_vtable[2] = (void *)bq_GetState;
+  p->bq_vtable[2] = (void *)bq_GetState_or_RegisterCallback;
   p->bq_vtable[3] = (void *)bq_RegisterCallback;
   p->bq_ptr = p->bq_vtable;
 
@@ -559,6 +682,12 @@ static SLresult engine_CreateAudioPlayer(void *self, void **pPlayer,
 
   if (pAudioSrc) {
     SLDataSource *src = (SLDataSource *)pAudioSrc;
+    if (src->pLocator) {
+      SLDataLocator_BufferQueue *loc = (SLDataLocator_BufferQueue *)src->pLocator;
+      if (loc->locatorType == SL_DATALOCATOR_BUFFERQUEUE) {
+        p->queue_capacity = loc->numBuffers;
+      }
+    }
     if (src->pFormat) {
       SLDataFormat_PCM *fmt = (SLDataFormat_PCM *)src->pFormat;
       if (fmt->formatType == SL_DATAFORMAT_PCM) {
@@ -641,14 +770,55 @@ void opensles_shim_pump_callbacks(void) {
     if (!p->active || p->play_state != SL_PLAYSTATE_PLAYING) continue;
 
     uint32_t readable = ring_readable(p);
+    uint32_t callback_threshold = p->last_enqueue_size;
+    if (callback_threshold == 0 || callback_threshold > (RING_BUFFER_SIZE / 2)) {
+      callback_threshold = RING_BUFFER_SIZE / 4;
+    }
 
-    if (p->callback && readable < RING_BUFFER_SIZE / 2) {
+    if (p->callback && readable <= callback_threshold) {
       uint32_t counter_before = p->enqueue_counter;
+      if (p->debug_callback_logs < 16 || counter_before % 64 == 0) {
+        debugPrintf("opensles_shim: player %d callback readable=%u threshold=%u counter=%u\n",
+                    i, readable, callback_threshold, counter_before);
+        p->debug_callback_logs++;
+      }
       p->callback(&p->bq_ptr, p->callback_context);
 
       if (p->ever_enqueued && !p->decoder_done &&
           p->enqueue_counter == counter_before) {
         p->decoder_done = 1;
+        debugPrintf("opensles_shim: player %d decoder_done after callback readable=%u counter=%u\n",
+                    i, ring_readable(p), p->enqueue_counter);
+      }
+    }
+
+    if (!p->callback && p->play_callback && readable <= callback_threshold) {
+      uint32_t counter_before = p->enqueue_counter;
+
+      if ((p->play_event_mask & SL_PLAYEVENT_HEADATNEWPOS) != 0) {
+        if (p->debug_play_callback_logs < 16 || counter_before % 64 == 0) {
+          //debugPrintf("opensles_shim: player %d play-fallback HEADATNEWPOS readable=%u threshold=%u counter=%u\n",
+          //            i, readable, callback_threshold, counter_before);
+          p->debug_play_callback_logs++;
+        }
+        p->play_callback(&p->play_ptr, p->play_callback_context, SL_PLAYEVENT_HEADATNEWPOS);
+      }
+
+      if (p->enqueue_counter == counter_before &&
+          (p->play_event_mask & SL_PLAYEVENT_HEADMOVING) != 0) {
+        if (p->debug_play_callback_logs < 16 || counter_before % 64 == 0) {
+          //debugPrintf("opensles_shim: player %d play-fallback HEADMOVING readable=%u threshold=%u counter=%u\n",
+          //            i, readable, callback_threshold, counter_before);
+          p->debug_play_callback_logs++;
+        }
+        p->play_callback(&p->play_ptr, p->play_callback_context, SL_PLAYEVENT_HEADMOVING);
+      }
+
+      if (p->ever_enqueued && !p->decoder_done &&
+          p->enqueue_counter == counter_before) {
+        p->decoder_done = 1;
+        debugPrintf("opensles_shim: player %d decoder_done after play-fallback readable=%u counter=%u\n",
+                    i, ring_readable(p), p->enqueue_counter);
       }
     }
 

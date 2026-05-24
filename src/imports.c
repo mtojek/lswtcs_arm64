@@ -861,8 +861,8 @@ static void glDrawElements_wrap(GLenum mode, GLsizei count, GLenum type,
   egl_shim_ensure_current();
   static _Thread_local int draw_log_count = 0;
   if (draw_log_count < 40 || draw_log_count % 200 == 0) {
-    debugPrintf("GL: glDrawElements(0x%x, count=%d, type=0x%x, indices=%p)\n",
-                mode, count, type, indices);
+    //debugPrintf("GL: glDrawElements(0x%x, count=%d, type=0x%x, indices=%p)\n",
+    //            mode, count, type, indices);
   }
   draw_log_count++;
   glDrawElements(mode, count, type, indices);
