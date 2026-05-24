@@ -384,6 +384,66 @@ static void patch_gl_constant_setter_table(void) {
                 (void *)table[3]);
 }
 
+static void patch_disable_touch_controls(void) {
+    uintptr_t addr = so_find_addr_safe("enable_touch_controls");
+    if (!addr) {
+        debugPrintf("Patch: enable_touch_controls not found, skipping touch-control disable patch\n");
+        return;
+    }
+
+    int *flag = (int *)addr;
+    int old = *flag;
+    *flag = 0;
+    debugPrintf("Patch: disabled enable_touch_controls at %p (old=%d new=%d)\n",
+                (void *)flag, old, *flag);
+}
+
+typedef struct {
+    int pad;
+    int port;
+    int is_active;
+} NuPadMapping;
+
+static NuPadMapping *g_nupad_mapping = NULL;
+static int g_nupad_mapping_logged = 0;
+
+static void patch_force_primary_gamepad_mapping(void) {
+    uintptr_t addr = so_find_addr_safe("g_nupadMapping");
+    if (!addr) {
+        debugPrintf("Patch: g_nupadMapping not found, skipping gamepad mapping patch\n");
+        return;
+    }
+
+    g_nupad_mapping = (NuPadMapping *)addr;
+    g_nupad_mapping[0].pad = 0;
+    g_nupad_mapping[0].port = 1;
+    g_nupad_mapping[0].is_active = 1;
+
+    debugPrintf("Patch: forced g_nupadMapping[0] at %p -> {pad=%d, port=%d, is_active=%d}\n",
+                (void *)&g_nupad_mapping[0],
+                g_nupad_mapping[0].pad,
+                g_nupad_mapping[0].port,
+                g_nupad_mapping[0].is_active);
+}
+
+static void maintain_primary_gamepad_mapping(void) {
+    if (!g_nupad_mapping) {
+        return;
+    }
+
+    if (g_nupad_mapping[0].pad != 0 ||
+        g_nupad_mapping[0].port != 1 ||
+        g_nupad_mapping[0].is_active != 1) {
+        g_nupad_mapping[0].pad = 0;
+        g_nupad_mapping[0].port = 1;
+        g_nupad_mapping[0].is_active = 1;
+        if (!g_nupad_mapping_logged) {
+            debugPrintf("Input: restored g_nupadMapping[0] -> {pad=0, port=1, is_active=1}\n");
+            g_nupad_mapping_logged = 1;
+        }
+    }
+}
+
 /* Crash handler — just dump and exit (no recovery, like Vita) */
 static void crash_handler(int sig, siginfo_t *info, void *uctx) {
     ucontext_t *uc = (ucontext_t *)uctx;
@@ -485,6 +545,7 @@ typedef struct {
 #define AKEYCODE_DPAD_DOWN      20
 #define AKEYCODE_DPAD_LEFT      21
 #define AKEYCODE_DPAD_RIGHT     22
+#define AKEYCODE_BACK           4
 #define AKEYCODE_BUTTON_A       96
 #define AKEYCODE_BUTTON_B       97
 #define AKEYCODE_BUTTON_X       99
@@ -499,11 +560,12 @@ typedef struct {
 #define AKEYCODE_BUTTON_SELECT  109
 
 static ButtonMapping button_map[] = {
-    { SDL_CONTROLLER_BUTTON_A,             AKEYCODE_BUTTON_A },
-    { SDL_CONTROLLER_BUTTON_B,             AKEYCODE_BUTTON_B },
+    /* Trimui uses Nintendo face-button layout, so swap A/B for Android gamepad semantics. */
+    { SDL_CONTROLLER_BUTTON_A,             AKEYCODE_BUTTON_B },
+    { SDL_CONTROLLER_BUTTON_B,             AKEYCODE_BUTTON_A },
     { SDL_CONTROLLER_BUTTON_X,             AKEYCODE_BUTTON_X },
     { SDL_CONTROLLER_BUTTON_Y,             AKEYCODE_BUTTON_Y },
-    { SDL_CONTROLLER_BUTTON_BACK,          AKEYCODE_BUTTON_SELECT },
+    { SDL_CONTROLLER_BUTTON_BACK,          AKEYCODE_BACK },
     { SDL_CONTROLLER_BUTTON_START,         AKEYCODE_BUTTON_START },
     { SDL_CONTROLLER_BUTTON_LEFTSTICK,     AKEYCODE_BUTTON_THUMBL },
     { SDL_CONTROLLER_BUTTON_RIGHTSTICK,    AKEYCODE_BUTTON_THUMBR },
@@ -516,16 +578,98 @@ static ButtonMapping button_map[] = {
 };
 
 static SDL_GameController *g_controller = NULL;
+static float g_last_hat_x = 0.0f;
+static float g_last_hat_y = 0.0f;
+static float g_last_lx = 0.0f;
+static float g_last_ly = 0.0f;
+static float g_last_rx = 0.0f;
+static float g_last_ry = 0.0f;
+static int g_last_l2_down = 0;
+static int g_last_r2_down = 0;
+static uint8_t g_button_states[SDL_CONTROLLER_BUTTON_MAX];
+
+#define STICK_DEADZONE   8000
+#define TRIGGER_THRESHOLD 16000
+
+static void send_native_key_down(void *env, int keycode, const char *source) {
+    debugPrintf("JNI input: nativeOnKeyDown(%d) source=%s\n", keycode, source);
+    activity.nativeOnKeyDown(env, ACTIVITY_CLASS, keycode);
+}
+
+static void send_native_key_up(void *env, int keycode, const char *source) {
+    debugPrintf("JNI input: nativeOnKeyUp(%d) source=%s\n", keycode, source);
+    activity.nativeOnKeyUp(env, ACTIVITY_CLASS, keycode);
+}
+
+static void send_native_touch_down(void *env, int pointer_id, float x, float y, const char *source) {
+    debugPrintf("JNI input: nativeOnTouchDown(id=%d, x=%.1f, y=%.1f) source=%s\n",
+                pointer_id, x, y, source);
+    activity.nativeOnTouchDown(env, ACTIVITY_CLASS, pointer_id, pointer_id, x, y);
+}
+
+static void send_native_touch_move(void *env, int pointer_id, float x, float y, const char *source) {
+    debugPrintf("JNI input: nativeOnTouchMove(id=%d, x=%.1f, y=%.1f) source=%s\n",
+                pointer_id, x, y, source);
+    activity.nativeOnTouchMove(env, ACTIVITY_CLASS, pointer_id, pointer_id, x, y);
+}
+
+static void send_native_touch_up(void *env, int pointer_id, const char *source) {
+    debugPrintf("JNI input: nativeOnTouchUp(id=%d) source=%s\n", pointer_id, source);
+    activity.nativeOnTouchUp(env, ACTIVITY_CLASS, pointer_id, pointer_id);
+}
+
+static void send_native_gamepad_axes(void *env, float hat_x, float hat_y,
+                                     float lx, float ly, float rx, float ry,
+                                     const char *source) {
+    debugPrintf("JNI input: nativeUpdateGamepadAxisValues hat(%.2f, %.2f) left(%.2f, %.2f) right(%.2f, %.2f) source=%s\n",
+                hat_x, hat_y, lx, ly, rx, ry, source);
+    activity.nativeUpdateGamepadAxisValues(env, ACTIVITY_CLASS, hat_x, hat_y, lx, ly, rx, ry);
+}
 
 static void open_controller(void) {
-    for (int i = 0; i < SDL_NumJoysticks(); i++) {
-        if (SDL_IsGameController(i)) {
+    int num_joysticks = SDL_NumJoysticks();
+    debugPrintf("Input: SDL_NumJoysticks() = %d\n", num_joysticks);
+
+    for (int i = 0; i < num_joysticks; i++) {
+        int is_controller = SDL_IsGameController(i);
+        const char *joy_name = SDL_JoystickNameForIndex(i);
+        debugPrintf("Input: joystick[%d] name=%s gamecontroller=%d\n",
+                    i, joy_name ? joy_name : "(null)", is_controller);
+        if (is_controller) {
             g_controller = SDL_GameControllerOpen(i);
             if (g_controller) {
+                memset(g_button_states, 0, sizeof(g_button_states));
                 debugPrintf("Controller opened: %s\n", SDL_GameControllerName(g_controller));
                 return;
+            } else {
+                debugPrintf("Input: SDL_GameControllerOpen(%d) failed: %s\n",
+                            i, SDL_GetError());
             }
         }
+    }
+
+    debugPrintf("Input: no SDL game controller opened\n");
+}
+
+static void poll_controller_buttons(void) {
+    if (!g_controller) return;
+
+    void *env = &g_jni_env;
+
+    for (int i = 0; i < (int)(sizeof(button_map) / sizeof(button_map[0])); i++) {
+        SDL_GameControllerButton button = button_map[i].sdl_button;
+        uint8_t down = SDL_GameControllerGetButton(g_controller, button) ? 1 : 0;
+        if (down == g_button_states[button])
+            continue;
+
+        g_button_states[button] = down;
+        debugPrintf("Input: button %d -> keycode %d %s\n",
+                    (int)button, button_map[i].android_keycode,
+                    down ? "DOWN" : "UP");
+        if (down)
+            send_native_key_down(env, button_map[i].android_keycode, "controller_button");
+        else
+            send_native_key_up(env, button_map[i].android_keycode, "controller_button");
     }
 }
 
@@ -534,10 +678,25 @@ static void poll_controller_axes(void) {
 
     void *env = &g_jni_env;
 
-    float lx = SDL_GameControllerGetAxis(g_controller, SDL_CONTROLLER_AXIS_LEFTX) / 32767.0f;
-    float ly = SDL_GameControllerGetAxis(g_controller, SDL_CONTROLLER_AXIS_LEFTY) / 32767.0f;
-    float rx = SDL_GameControllerGetAxis(g_controller, SDL_CONTROLLER_AXIS_RIGHTX) / 32767.0f;
-    float ry = SDL_GameControllerGetAxis(g_controller, SDL_CONTROLLER_AXIS_RIGHTY) / 32767.0f;
+    int raw_lx = SDL_GameControllerGetAxis(g_controller, SDL_CONTROLLER_AXIS_LEFTX);
+    int raw_ly = SDL_GameControllerGetAxis(g_controller, SDL_CONTROLLER_AXIS_LEFTY);
+    int raw_rx = SDL_GameControllerGetAxis(g_controller, SDL_CONTROLLER_AXIS_RIGHTX);
+    int raw_ry = SDL_GameControllerGetAxis(g_controller, SDL_CONTROLLER_AXIS_RIGHTY);
+    int raw_l2 = SDL_GameControllerGetAxis(g_controller, SDL_CONTROLLER_AXIS_TRIGGERLEFT);
+    int raw_r2 = SDL_GameControllerGetAxis(g_controller, SDL_CONTROLLER_AXIS_TRIGGERRIGHT);
+
+    float lx = (raw_lx > STICK_DEADZONE || raw_lx < -STICK_DEADZONE)
+                   ? (float)raw_lx / 32767.0f
+                   : 0.0f;
+    float ly = (raw_ly > STICK_DEADZONE || raw_ly < -STICK_DEADZONE)
+                   ? (float)raw_ly / 32767.0f
+                   : 0.0f;
+    float rx = (raw_rx > STICK_DEADZONE || raw_rx < -STICK_DEADZONE)
+                   ? (float)raw_rx / 32767.0f
+                   : 0.0f;
+    float ry = (raw_ry > STICK_DEADZONE || raw_ry < -STICK_DEADZONE)
+                   ? (float)raw_ry / 32767.0f
+                   : 0.0f;
 
     /* Hat from D-pad (already handled as buttons, but report axis too) */
     int du = SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_DPAD_UP);
@@ -547,7 +706,42 @@ static void poll_controller_axes(void) {
     float hatX = (float)(dr - dl);
     float hatY = (float)(dd - du);
 
-    activity.nativeUpdateGamepadAxisValues(env, ACTIVITY_CLASS, hatX, hatY, lx, ly, rx, ry);
+    if (hatX != g_last_hat_x || hatY != g_last_hat_y ||
+        lx != g_last_lx || ly != g_last_ly ||
+        rx != g_last_rx || ry != g_last_ry) {
+        debugPrintf("Input: axes hat(%.2f, %.2f) left(%.2f, %.2f) right(%.2f, %.2f)\n",
+                    hatX, hatY, lx, ly, rx, ry);
+        send_native_gamepad_axes(env, hatX, hatY, lx, ly, rx, ry, "controller_axes");
+        g_last_hat_x = hatX;
+        g_last_hat_y = hatY;
+        g_last_lx = lx;
+        g_last_ly = ly;
+        g_last_rx = rx;
+        g_last_ry = ry;
+    }
+
+    int l2_down = raw_l2 > TRIGGER_THRESHOLD;
+    int r2_down = raw_r2 > TRIGGER_THRESHOLD;
+
+    if (l2_down != g_last_l2_down) {
+        debugPrintf("Input: trigger L2 %s (raw=%d)\n",
+                    l2_down ? "DOWN" : "UP", raw_l2);
+        if (l2_down)
+            send_native_key_down(env, AKEYCODE_BUTTON_L2, "controller_l2");
+        else
+            send_native_key_up(env, AKEYCODE_BUTTON_L2, "controller_l2");
+        g_last_l2_down = l2_down;
+    }
+
+    if (r2_down != g_last_r2_down) {
+        debugPrintf("Input: trigger R2 %s (raw=%d)\n",
+                    r2_down ? "DOWN" : "UP", raw_r2);
+        if (r2_down)
+            send_native_key_down(env, AKEYCODE_BUTTON_R2, "controller_r2");
+        else
+            send_native_key_up(env, AKEYCODE_BUTTON_R2, "controller_r2");
+        g_last_r2_down = r2_down;
+    }
 }
 
 int main(int argc, char *argv[]) {
@@ -597,6 +791,8 @@ int main(int argc, char *argv[]) {
     patch_all_stack_chk_branches();
     patch_endcriticalsectiongl_force_release();
     patch_gl_constant_setter_table();
+    patch_disable_touch_controls();
+    patch_force_primary_gamepad_mapping();
 
     /* Finalize: make text read-only+exec, flush caches */
     so_finalize();
@@ -693,6 +889,8 @@ int main(int argc, char *argv[]) {
 
     /* Open controller if available */
     open_controller();
+    SDL_GameControllerEventState(SDL_ENABLE);
+    SDL_JoystickEventState(SDL_ENABLE);
 
     /* Main event loop */
     int running = 1;
@@ -702,24 +900,6 @@ int main(int argc, char *argv[]) {
             switch (event.type) {
             case SDL_QUIT:
                 running = 0;
-                break;
-
-            case SDL_CONTROLLERBUTTONDOWN:
-                for (int i = 0; i < (int)(sizeof(button_map) / sizeof(button_map[0])); i++) {
-                    if (event.cbutton.button == button_map[i].sdl_button) {
-                        activity.nativeOnKeyDown(env, ACTIVITY_CLASS, button_map[i].android_keycode);
-                        break;
-                    }
-                }
-                break;
-
-            case SDL_CONTROLLERBUTTONUP:
-                for (int i = 0; i < (int)(sizeof(button_map) / sizeof(button_map[0])); i++) {
-                    if (event.cbutton.button == button_map[i].sdl_button) {
-                        activity.nativeOnKeyUp(env, ACTIVITY_CLASS, button_map[i].android_keycode);
-                        break;
-                    }
-                }
                 break;
 
             case SDL_CONTROLLERDEVICEADDED:
@@ -736,20 +916,19 @@ int main(int argc, char *argv[]) {
                 break;
 
             case SDL_FINGERDOWN:
-                activity.nativeOnTouchDown(env, ACTIVITY_CLASS,
-                    (int)event.tfinger.fingerId, (int)event.tfinger.fingerId,
-                    event.tfinger.x * SCREEN_WIDTH, event.tfinger.y * SCREEN_HEIGHT);
+                send_native_touch_down(env, (int)event.tfinger.fingerId,
+                    event.tfinger.x * SCREEN_WIDTH, event.tfinger.y * SCREEN_HEIGHT,
+                    "sdl_finger");
                 break;
 
             case SDL_FINGERMOTION:
-                activity.nativeOnTouchMove(env, ACTIVITY_CLASS,
-                    (int)event.tfinger.fingerId, (int)event.tfinger.fingerId,
-                    event.tfinger.x * SCREEN_WIDTH, event.tfinger.y * SCREEN_HEIGHT);
+                send_native_touch_move(env, (int)event.tfinger.fingerId,
+                    event.tfinger.x * SCREEN_WIDTH, event.tfinger.y * SCREEN_HEIGHT,
+                    "sdl_finger");
                 break;
 
             case SDL_FINGERUP:
-                activity.nativeOnTouchUp(env, ACTIVITY_CLASS,
-                    (int)event.tfinger.fingerId, (int)event.tfinger.fingerId);
+                send_native_touch_up(env, (int)event.tfinger.fingerId, "sdl_finger");
                 break;
 
             default:
@@ -757,8 +936,18 @@ int main(int argc, char *argv[]) {
             }
         }
 
+        SDL_GameControllerUpdate();
+
+        /* Poll digital buttons every frame instead of relying on SDL button events.
+           This is more reliable on Trimui/SDL builds where controller events can be flaky. */
+        poll_controller_buttons();
+
         /* Poll analog axes */
         poll_controller_axes();
+
+        /* Android frontend path can keep trying to remap back to touch-first.
+           Keep logical pad 0 bound to the physical gamepad port. */
+        maintain_primary_gamepad_mapping();
 
         /* Pump OpenSL ES audio callbacks */
         opensles_shim_pump_callbacks();
