@@ -60,3 +60,5 @@ build/
 # Game assets (not redistributable)
 assets/*.so
 assets/*.dat
+
+.claude/
