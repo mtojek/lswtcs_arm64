@@ -495,8 +495,8 @@ static const GLubyte *glGetString_wrap(GLenum name) {
   case 0x1f02: /* GL_VERSION */
   case 0x8b8c: /* GL_SHADING_LANGUAGE_VERSION */ {
     const GLubyte *s = glGetString(name);
-    debugPrintf("GL: glGetString(0x%x) = \"%s\"\n", name,
-                s ? (const char *)s : "(null)");
+    /* debugPrintf("GL: glGetString(0x%x) = \"%s\"\n", name,
+                s ? (const char *)s : "(null)")); */
     if (s)
       return s;
 
@@ -529,8 +529,8 @@ static const GLubyte *glGetString_wrap(GLenum name) {
 
     const GLubyte *ext = glGetString(name);
     if (ext && ext[0] != '\0') {
-      debugPrintf("GL: glGetString(GL_EXTENSIONS) -> driver string (%zu bytes)\n",
-                  strlen((const char *)ext));
+      /* debugPrintf("GL: glGetString(GL_EXTENSIONS) -> driver string (%zu bytes)\n",
+                  strlen((const char *)ext)); */
       return ext;
     }
 
@@ -576,13 +576,13 @@ static const GLubyte *glGetString_wrap(GLenum name) {
       }
     }
 
-    debugPrintf("GL: glGetString(GL_EXTENSIONS) -> fallback list (%zu bytes)\n",
-                sizeof(fallback_ext) - 1);
+    /* debugPrintf("GL: glGetString(GL_EXTENSIONS) -> fallback list (%zu bytes)\n",
+                sizeof(fallback_ext) - 1); */
     return fallback_ext;
   }
   default: {
     const GLubyte *s = glGetString(name);
-    debugPrintf("GL: glGetString(0x%x) = \"%s\"\n", name, s ? (const char *)s : "(null)");
+    /* debugPrintf("GL: glGetString(0x%x) = \"%s\"\n", name, s ? (const char *)s : "(null)"); */
     return s;
   }
   }
@@ -628,7 +628,7 @@ static void glGenFramebuffers_wrap(GLsizei n, GLuint *framebuffers) {
 static void glGenBuffers_wrap(GLsizei n, GLuint *buffers) {
   egl_shim_ensure_current();
   glGenBuffers(n, buffers);
-  debugPrintf("GL: glGenBuffers(%d) = %u\n", n, buffers ? buffers[0] : 0);
+  /* debugPrintf("GL: glGenBuffers(%d) = %u\n", n, buffers ? buffers[0] : 0); */
 }
 
 static void glBindFramebuffer_wrap(GLenum target, GLuint framebuffer) {
@@ -872,7 +872,7 @@ static void glViewport_wrap(GLint x, GLint y, GLsizei width, GLsizei height) {
   egl_shim_ensure_current();
   static _Thread_local int viewport_log_count = 0;
   if (viewport_log_count < 20) {
-    debugPrintf("GL: glViewport(%d, %d, %d, %d)\n", x, y, width, height);
+    /* debugPrintf("GL: glViewport(%d, %d, %d, %d)\n", x, y, width, height); */
     viewport_log_count++;
   }
   glViewport(x, y, width, height);
