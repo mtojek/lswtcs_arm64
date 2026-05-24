@@ -1,0 +1,552 @@
+/*
+ * main.c -- entry point for LSWTCS ARM64 Linux port
+ *
+ * Loads libTTapp.so, resolves imports, creates a fake Android/JNI
+ * environment, and drives the TTActivity startup sequence.
+ */
+
+#include <pthread.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <ucontext.h>
+#include <unistd.h>
+
+#include <SDL2/SDL.h>
+
+#include "android_shim.h"
+#include "egl_shim.h"
+#include "error.h"
+#include "imports.h"
+#include "jni_shim.h"
+#include "opensles_shim.h"
+#include "so_util.h"
+#include "util.h"
+
+#define MEMORY_MB 256
+#define SO_NAME "libTTapp.so"
+
+#define SCREEN_WIDTH 1280
+#define SCREEN_HEIGHT 720
+
+static pthread_t g_main_thread;
+
+#define ACTIVITY_CLASS ((void *)0x42424242)
+
+/* Paths matching Android asset pack layout */
+#define INTERNAL_PATH "/data/user/0/com.wb.lego.tcs/files"
+
+#define ASSET_PACK_AUDIO    INTERNAL_PATH "/assetpacks/asset_Audio/20202/20202/assets/Audio.dat"
+#define ASSET_PACK_LEVELS   INTERNAL_PATH "/assetpacks/asset_Levels/20202/20202/assets/Levels.dat"
+#define ASSET_PACK_OTHERS   INTERNAL_PATH "/assetpacks/asset_Others/20202/20202/assets/Others.dat"
+#define ASSET_PACK_TEXTURES INTERNAL_PATH "/assetpacks/asset_Textures/20202/20202/assets/Textures.dat"
+
+#define APK_VERSION_NAME "2.0.2.02"
+
+/* OBB info from obb_info.xml */
+#define OBB_INFO_MAIN_VERSION 2017
+#define OBB_INFO_MAIN_SIZE 2
+#define OBB_INFO_PATCH_VERSION 2017
+#define OBB_INFO_PATCH_SIZE 0
+#define OBB_INFO_FORCE_ETC1 1
+
+/* TTActivity function pointers */
+typedef void (*fn_void_env_cls)(void *, void *);
+typedef void (*fn_void_env_cls_str)(void *, void *, void *);
+typedef void (*fn_void_env_cls_int)(void *, void *, int);
+typedef void (*fn_void_env_cls_bool)(void *, void *, int);
+typedef void (*fn_void_env_cls_obj)(void *, void *, void *);
+typedef void (*fn_void_env_cls_6int_str_int)(void *, void *, int, int, int, int, void *, int);
+typedef void (*fn_void_env_cls_objarray)(void *, void *, void *);
+typedef void (*fn_void_env_cls_2float)(void *, void *, float, float);
+typedef void (*fn_void_env_cls_int_int_2float)(void *, void *, int, int, float, float);
+typedef void (*fn_void_env_cls_int_int)(void *, void *, int, int);
+typedef void (*fn_void_env_cls_6float)(void *, void *, float, float, float, float, float, float);
+typedef int (*fn_int_vm_ptr)(void *, void *);
+
+static struct {
+    fn_void_env_cls           nativeCacheJNIVars;
+    fn_void_env_cls_str       nativeSetManufacturer;
+    fn_void_env_cls_str       nativeSetModel;
+    fn_void_env_cls_6int_str_int nativeSetObbInfo;
+    fn_void_env_cls_objarray  nativeAddAssetsPath;
+    fn_void_env_cls_int       nativeSetCaps;
+    fn_void_env_cls_str       nativeSetPath;
+    fn_void_env_cls_str       nativeSetLanguage;
+    fn_void_env_cls_str       nativeSetAndroidVersion;
+    fn_void_env_cls_obj       nativeSetAssetManager;
+    fn_void_env_cls           nativeOnCreate;
+    fn_void_env_cls           nativeOnStart;
+    fn_void_env_cls           nativeOnResume;
+    fn_void_env_cls_obj       nativeSetSurface;
+    fn_void_env_cls_2float    nativeSetScreenDimesions;
+    fn_void_env_cls_bool      nativeOnWindowFocusChanged;
+    fn_void_env_cls           nativeOnPause;
+    fn_void_env_cls           nativeOnStop;
+    fn_void_env_cls_int       nativeOnKeyDown;
+    fn_void_env_cls_int       nativeOnKeyUp;
+    fn_void_env_cls_int_int_2float nativeOnTouchDown;
+    fn_void_env_cls_int_int_2float nativeOnTouchMove;
+    fn_void_env_cls_int_int   nativeOnTouchUp;
+    fn_void_env_cls_6float    nativeUpdateGamepadAxisValues;
+} activity;
+
+/* Resolve a TTActivity symbol or die */
+static void *must_resolve(const char *name) {
+    uintptr_t addr = so_find_addr(name);
+    if (!addr)
+        fatal_error("Could not find %s in %s", name, SO_NAME);
+    return (void *)addr;
+}
+
+static void tt_activity_init(void) {
+#define RESOLVE(field, sym) activity.field = (typeof(activity.field))must_resolve("Java_com_tt_tech_TTActivity_" sym)
+    RESOLVE(nativeCacheJNIVars,        "nativeCacheJNIVars");
+    RESOLVE(nativeSetManufacturer,     "nativeSetManufacturer");
+    RESOLVE(nativeSetModel,            "nativeSetModel");
+    RESOLVE(nativeSetObbInfo,          "nativeSetObbInfo");
+    RESOLVE(nativeAddAssetsPath,       "nativeAddAssetsPath");
+    RESOLVE(nativeSetCaps,             "nativeSetCaps");
+    RESOLVE(nativeSetPath,             "nativeSetPath");
+    RESOLVE(nativeSetLanguage,         "nativeSetLanguage");
+    RESOLVE(nativeSetAndroidVersion,   "nativeSetAndroidVersion");
+    RESOLVE(nativeSetAssetManager,     "nativeSetAssetManager");
+    RESOLVE(nativeOnCreate,            "nativeOnCreate");
+    RESOLVE(nativeOnStart,             "nativeOnStart");
+    RESOLVE(nativeOnResume,            "nativeOnResume");
+    RESOLVE(nativeSetSurface,          "nativeSetSurface");
+    RESOLVE(nativeSetScreenDimesions,  "nativeSetScreenDimesions");
+    RESOLVE(nativeOnWindowFocusChanged,"nativeOnWindowFocusChanged");
+    RESOLVE(nativeOnPause,             "nativeOnPause");
+    RESOLVE(nativeOnStop,              "nativeOnStop");
+    RESOLVE(nativeOnKeyDown,           "nativeOnKeyDown");
+    RESOLVE(nativeOnKeyUp,             "nativeOnKeyUp");
+    RESOLVE(nativeOnTouchDown,         "nativeOnTouchDown");
+    RESOLVE(nativeOnTouchMove,         "nativeOnTouchMove");
+    RESOLVE(nativeOnTouchUp,           "nativeOnTouchUp");
+    RESOLVE(nativeUpdateGamepadAxisValues, "nativeUpdateGamepadAxisValues");
+#undef RESOLVE
+
+    debugPrintf("TTActivity: all 24 symbols resolved\n");
+}
+
+/* Fake jobjectArray for asset paths (game reads it via JNI GetObjectArrayElement) */
+static void *g_asset_paths[4];
+static struct {
+    int length;
+    void **elements;
+} g_asset_array = { 4, g_asset_paths };
+
+static void tt_activity_on_create(void) {
+    void *env = &g_jni_env;
+
+    /* Build fake asset paths array */
+    g_asset_paths[0] = (void *)ASSET_PACK_AUDIO;
+    g_asset_paths[1] = (void *)ASSET_PACK_LEVELS;
+    g_asset_paths[2] = (void *)ASSET_PACK_OTHERS;
+    g_asset_paths[3] = (void *)ASSET_PACK_TEXTURES;
+
+    activity.nativeCacheJNIVars(env, ACTIVITY_CLASS);
+    debugPrintf("TTActivity: nativeCacheJNIVars done\n");
+
+    activity.nativeSetManufacturer(env, ACTIVITY_CLASS, (void *)"Trimui");
+    activity.nativeSetModel(env, ACTIVITY_CLASS, (void *)"Smart Pro");
+
+    activity.nativeSetObbInfo(env, ACTIVITY_CLASS,
+        OBB_INFO_MAIN_VERSION, OBB_INFO_MAIN_SIZE,
+        OBB_INFO_PATCH_VERSION, OBB_INFO_PATCH_SIZE,
+        (void *)APK_VERSION_NAME, OBB_INFO_FORCE_ETC1);
+
+    activity.nativeAddAssetsPath(env, ACTIVITY_CLASS, &g_asset_array);
+    activity.nativeSetCaps(env, ACTIVITY_CLASS, 0);
+
+    activity.nativeSetPath(env, ACTIVITY_CLASS, (void *)INTERNAL_PATH);
+    activity.nativeSetLanguage(env, ACTIVITY_CLASS, (void *)"en");
+    activity.nativeSetAndroidVersion(env, ACTIVITY_CLASS, (void *)"5.0.2");
+    activity.nativeSetAssetManager(env, ACTIVITY_CLASS, (void *)0x24242424);
+
+    activity.nativeOnCreate(env, ACTIVITY_CLASS);
+    debugPrintf("TTActivity: nativeOnCreate done\n");
+}
+
+/* Crash handler — just dump and exit (no recovery, like Vita) */
+static void crash_handler(int sig, siginfo_t *info, void *uctx) {
+    ucontext_t *uc = (ucontext_t *)uctx;
+    uintptr_t pc = uc->uc_mcontext.pc;
+    uintptr_t fault_addr = (uintptr_t)info->si_addr;
+    uintptr_t text = (uintptr_t)text_base;
+    uintptr_t data = (uintptr_t)data_base;
+
+    fprintf(stderr, "\n=== CRASH ===\n");
+    fprintf(stderr, "Signal: %d (%s)\n", sig,
+            sig == SIGSEGV ? "SIGSEGV" : sig == SIGBUS ? "SIGBUS" :
+            sig == SIGABRT ? "SIGABRT" : sig == SIGFPE ? "SIGFPE" : "?");
+    fprintf(stderr, "Fault addr: %p\n", (void *)fault_addr);
+    fprintf(stderr, "PC:         %p\n", (void *)pc);
+
+    if (pc >= text && pc < text + text_size)
+        fprintf(stderr, "PC in .text: offset 0x%lx\n", (unsigned long)(pc - text));
+    else if (pc >= data && pc < data + data_size)
+        fprintf(stderr, "PC in .data: offset 0x%lx\n", (unsigned long)(pc - data));
+    else
+        fprintf(stderr, "PC outside libTTapp.so\n");
+
+    fprintf(stderr, "\nRegisters:\n");
+    for (int i = 0; i < 31; i++) {
+        fprintf(stderr, "  x%-2d = 0x%016lx", i, (unsigned long)uc->uc_mcontext.regs[i]);
+        if (i % 3 == 2 || i == 30)
+            fprintf(stderr, "\n");
+    }
+    fprintf(stderr, "  sp  = 0x%016lx\n", (unsigned long)uc->uc_mcontext.sp);
+    fprintf(stderr, "  pc  = 0x%016lx\n", (unsigned long)uc->uc_mcontext.pc);
+
+    /* Backtrace */
+    fprintf(stderr, "\nBacktrace:\n");
+    fprintf(stderr, "  #0  pc %p", (void *)pc);
+    if (pc >= text && pc < text + text_size)
+        fprintf(stderr, " (libTTapp.so+0x%lx)", (unsigned long)(pc - text));
+    fprintf(stderr, "\n");
+
+    uintptr_t fp = uc->uc_mcontext.regs[29];
+    for (int frame = 1; frame < 32 && fp; frame++) {
+        uintptr_t *fp_ptr = (uintptr_t *)fp;
+        uintptr_t next_fp = fp_ptr[0];
+        uintptr_t lr = fp_ptr[1];
+        if (!lr) break;
+        fprintf(stderr, "  #%-2d lr %p", frame, (void *)lr);
+        if (lr >= text && lr < text + text_size)
+            fprintf(stderr, " (libTTapp.so+0x%lx)", (unsigned long)(lr - text));
+        fprintf(stderr, "\n");
+        if (next_fp <= fp) break;
+        fp = next_fp;
+    }
+
+    fprintf(stderr, "\nso text_base=%p text_size=0x%zx\n", text_base, text_size);
+    fprintf(stderr, "so data_base=%p data_size=0x%zx\n", data_base, data_size);
+    fprintf(stderr, "Thread: %lx (main=%lx)\n",
+            (unsigned long)pthread_self(), (unsigned long)g_main_thread);
+
+    /* Show which library contains the crash PC */
+    fprintf(stderr, "\nMemory maps (near PC):\n");
+    FILE *maps = fopen("/proc/self/maps", "r");
+    if (maps) {
+        char line[512];
+        while (fgets(line, sizeof(line), maps)) {
+            unsigned long start, end;
+            if (sscanf(line, "%lx-%lx", &start, &end) == 2) {
+                if (pc >= start && pc < end)
+                    fprintf(stderr, ">>> %s", line);
+            }
+        }
+        fclose(maps);
+    }
+
+    fprintf(stderr, "=== END CRASH ===\n");
+    fflush(stderr);
+
+    _exit(128 + sig);
+}
+
+static void install_crash_handler(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = crash_handler;
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+    sigaction(SIGABRT, &sa, NULL);
+    sigaction(SIGFPE, &sa, NULL);
+    sigaction(SIGILL, &sa, NULL);
+}
+
+/* SDL gamepad button to Android keycode mapping */
+typedef struct {
+    SDL_GameControllerButton sdl_button;
+    int android_keycode;
+} ButtonMapping;
+
+/* Android keycodes (from android/keycodes.h) */
+#define AKEYCODE_DPAD_UP        19
+#define AKEYCODE_DPAD_DOWN      20
+#define AKEYCODE_DPAD_LEFT      21
+#define AKEYCODE_DPAD_RIGHT     22
+#define AKEYCODE_BUTTON_A       96
+#define AKEYCODE_BUTTON_B       97
+#define AKEYCODE_BUTTON_X       99
+#define AKEYCODE_BUTTON_Y       100
+#define AKEYCODE_BUTTON_L1      102
+#define AKEYCODE_BUTTON_R1      103
+#define AKEYCODE_BUTTON_L2      104
+#define AKEYCODE_BUTTON_R2      105
+#define AKEYCODE_BUTTON_THUMBL  106
+#define AKEYCODE_BUTTON_THUMBR  107
+#define AKEYCODE_BUTTON_START   108
+#define AKEYCODE_BUTTON_SELECT  109
+
+static ButtonMapping button_map[] = {
+    { SDL_CONTROLLER_BUTTON_A,             AKEYCODE_BUTTON_A },
+    { SDL_CONTROLLER_BUTTON_B,             AKEYCODE_BUTTON_B },
+    { SDL_CONTROLLER_BUTTON_X,             AKEYCODE_BUTTON_X },
+    { SDL_CONTROLLER_BUTTON_Y,             AKEYCODE_BUTTON_Y },
+    { SDL_CONTROLLER_BUTTON_BACK,          AKEYCODE_BUTTON_SELECT },
+    { SDL_CONTROLLER_BUTTON_START,         AKEYCODE_BUTTON_START },
+    { SDL_CONTROLLER_BUTTON_LEFTSTICK,     AKEYCODE_BUTTON_THUMBL },
+    { SDL_CONTROLLER_BUTTON_RIGHTSTICK,    AKEYCODE_BUTTON_THUMBR },
+    { SDL_CONTROLLER_BUTTON_LEFTSHOULDER,  AKEYCODE_BUTTON_L1 },
+    { SDL_CONTROLLER_BUTTON_RIGHTSHOULDER, AKEYCODE_BUTTON_R1 },
+    { SDL_CONTROLLER_BUTTON_DPAD_UP,       AKEYCODE_DPAD_UP },
+    { SDL_CONTROLLER_BUTTON_DPAD_DOWN,     AKEYCODE_DPAD_DOWN },
+    { SDL_CONTROLLER_BUTTON_DPAD_LEFT,     AKEYCODE_DPAD_LEFT },
+    { SDL_CONTROLLER_BUTTON_DPAD_RIGHT,    AKEYCODE_DPAD_RIGHT },
+};
+
+static SDL_GameController *g_controller = NULL;
+
+static void open_controller(void) {
+    for (int i = 0; i < SDL_NumJoysticks(); i++) {
+        if (SDL_IsGameController(i)) {
+            g_controller = SDL_GameControllerOpen(i);
+            if (g_controller) {
+                debugPrintf("Controller opened: %s\n", SDL_GameControllerName(g_controller));
+                return;
+            }
+        }
+    }
+}
+
+static void poll_controller_axes(void) {
+    if (!g_controller) return;
+
+    void *env = &g_jni_env;
+
+    float lx = SDL_GameControllerGetAxis(g_controller, SDL_CONTROLLER_AXIS_LEFTX) / 32767.0f;
+    float ly = SDL_GameControllerGetAxis(g_controller, SDL_CONTROLLER_AXIS_LEFTY) / 32767.0f;
+    float rx = SDL_GameControllerGetAxis(g_controller, SDL_CONTROLLER_AXIS_RIGHTX) / 32767.0f;
+    float ry = SDL_GameControllerGetAxis(g_controller, SDL_CONTROLLER_AXIS_RIGHTY) / 32767.0f;
+
+    /* Hat from D-pad (already handled as buttons, but report axis too) */
+    int du = SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_DPAD_UP);
+    int dd = SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_DPAD_DOWN);
+    int dl = SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_DPAD_LEFT);
+    int dr = SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_DPAD_RIGHT);
+    float hatX = (float)(dr - dl);
+    float hatY = (float)(dd - du);
+
+    activity.nativeUpdateGamepadAxisValues(env, ACTIVITY_CLASS, hatX, hatY, lx, ly, rx, ry);
+}
+
+int main(int argc, char *argv[]) {
+    (void)argc;
+    (void)argv;
+
+    g_main_thread = pthread_self();
+
+    debugPrintf("=== LSWTCS ARM64 Linux Port (Trimui Smart Pro) ===\n");
+
+    /* Set data path for AAssetManager (current directory by default) */
+    android_shim_set_data_path(".");
+
+    /* Allocate heap for the .so loader */
+    size_t heap_size = MEMORY_MB * 1024 * 1024;
+    void *heap = mmap(NULL, heap_size, PROT_READ | PROT_WRITE | PROT_EXEC,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (heap == MAP_FAILED)
+        fatal_error("Failed to allocate %d MB heap", MEMORY_MB);
+    debugPrintf("Heap allocated: %p (%d MB)\n", heap, MEMORY_MB);
+
+    /* Load the shared object */
+    debugPrintf("Loading %s...\n", SO_NAME);
+    if (so_load(SO_NAME, heap, heap_size) < 0)
+        fatal_error("Failed to load %s", SO_NAME);
+    debugPrintf("Loaded %s: text=%p+%zu data=%p+%zu\n",
+                SO_NAME, text_base, text_size, data_base, data_size);
+
+    /* Relocate */
+    debugPrintf("Relocating...\n");
+    if (so_relocate() < 0)
+        fatal_error("Failed to relocate %s", SO_NAME);
+
+    /* Resolve imports */
+    debugPrintf("Resolving %zu imports...\n", dynlib_numfunctions);
+    if (so_resolve(dynlib_functions, dynlib_numfunctions, 0) < 0)
+        fatal_error("Failed to resolve imports");
+
+    /* Finalize: make text read-only+exec, flush caches */
+    so_finalize();
+    so_flush_caches();
+
+    /* Run .init_array constructors */
+    debugPrintf("Running init array...\n");
+    so_execute_init_array();
+
+    /* Initialize SDL */
+    debugPrintf("Initializing SDL...\n");
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) < 0)
+        fatal_error("SDL_Init failed: %s", SDL_GetError());
+    debugPrintf("SDL initialized OK\n");
+
+    /* Create SDL window + GL context from main thread (before .so render thread starts) */
+    egl_shim_create_window();
+
+    /* Install crash handler AFTER SDL (SDL_Init installs its own signal handlers,
+       we need ours to override them so we see real crash locations) */
+    install_crash_handler();
+
+    /* Dump memory maps for crash analysis */
+    {
+        FILE *maps = fopen("/proc/self/maps", "r");
+        if (maps) {
+            char line[512];
+            debugPrintf("=== Memory maps (libraries) ===\n");
+            while (fgets(line, sizeof(line), maps)) {
+                /* Only show executable or interesting mappings */
+                if (strstr(line, " r-xp ") || strstr(line, ".so"))
+                    debugPrintf("  %s", line);
+            }
+            fclose(maps);
+            debugPrintf("=== End maps ===\n");
+        }
+    }
+
+    /* Initialize shims */
+    jni_shim_init();
+    debugPrintf("JNI shim initialized\n");
+
+    /* Resolve all TTActivity function pointers */
+    tt_activity_init();
+
+    /* Call JNI_OnLoad */
+    debugPrintf("Calling JNI_OnLoad...\n");
+    fn_int_vm_ptr jni_onload = (fn_int_vm_ptr)so_find_addr("JNI_OnLoad");
+    if (jni_onload) {
+        int ver = jni_onload(&g_jni_vm, NULL);
+        debugPrintf("JNI_OnLoad returned: 0x%x\n", ver);
+    } else {
+        debugPrintf("JNI_OnLoad not found, skipping\n");
+    }
+
+    /* Register gamepad as connected */
+    debugPrintf("Registering gamepad...\n");
+    {
+        typedef void (*fn_gamepad)(void *, void *, int);
+        fn_gamepad set_gamepad = (fn_gamepad)so_find_addr(
+            "Java_com_tt_tech_CheckGamepadStatus_nativeSetGamePadConnected");
+        if (set_gamepad) {
+            set_gamepad(&g_jni_env, ACTIVITY_CLASS, 1);
+            debugPrintf("Gamepad registered as connected\n");
+        }
+    }
+
+    /* TTActivity startup sequence */
+    debugPrintf("Starting TTActivity sequence...\n");
+    tt_activity_on_create();
+
+    void *env = &g_jni_env;
+
+    activity.nativeOnStart(env, ACTIVITY_CLASS);
+    debugPrintf("TTActivity: nativeOnStart done\n");
+
+    activity.nativeOnResume(env, ACTIVITY_CLASS);
+    debugPrintf("TTActivity: nativeOnResume done\n");
+
+    /* Surface created/changed */
+    activity.nativeSetSurface(env, ACTIVITY_CLASS, (void *)0x24242424);
+    debugPrintf("TTActivity: nativeSetSurface done\n");
+
+    /* Screen dimensions: physical size in mm for Trimui Smart Pro (4.96" @ 1280x720) */
+    float width_mm = (1280.0f / 220.0f) * 25.4f;
+    float height_mm = (720.0f / 220.0f) * 25.4f;
+    activity.nativeSetScreenDimesions(env, ACTIVITY_CLASS, width_mm, height_mm);
+    debugPrintf("TTActivity: nativeSetScreenDimesions done (%.1f x %.1f mm)\n", width_mm, height_mm);
+
+    activity.nativeOnWindowFocusChanged(env, ACTIVITY_CLASS, 1);
+    debugPrintf("TTActivity: nativeOnWindowFocusChanged done\n");
+
+    debugPrintf("=== Game started, entering event loop ===\n");
+
+    /* Open controller if available */
+    open_controller();
+
+    /* Main event loop */
+    int running = 1;
+    while (running) {
+        SDL_Event event;
+        while (SDL_PollEvent(&event)) {
+            switch (event.type) {
+            case SDL_QUIT:
+                running = 0;
+                break;
+
+            case SDL_CONTROLLERBUTTONDOWN:
+                for (int i = 0; i < (int)(sizeof(button_map) / sizeof(button_map[0])); i++) {
+                    if (event.cbutton.button == button_map[i].sdl_button) {
+                        activity.nativeOnKeyDown(env, ACTIVITY_CLASS, button_map[i].android_keycode);
+                        break;
+                    }
+                }
+                break;
+
+            case SDL_CONTROLLERBUTTONUP:
+                for (int i = 0; i < (int)(sizeof(button_map) / sizeof(button_map[0])); i++) {
+                    if (event.cbutton.button == button_map[i].sdl_button) {
+                        activity.nativeOnKeyUp(env, ACTIVITY_CLASS, button_map[i].android_keycode);
+                        break;
+                    }
+                }
+                break;
+
+            case SDL_CONTROLLERDEVICEADDED:
+                if (!g_controller) open_controller();
+                break;
+
+            case SDL_CONTROLLERDEVICEREMOVED:
+                if (g_controller &&
+                    event.cdevice.which == SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(g_controller))) {
+                    SDL_GameControllerClose(g_controller);
+                    g_controller = NULL;
+                    debugPrintf("Controller disconnected\n");
+                }
+                break;
+
+            case SDL_FINGERDOWN:
+                activity.nativeOnTouchDown(env, ACTIVITY_CLASS,
+                    (int)event.tfinger.fingerId, (int)event.tfinger.fingerId,
+                    event.tfinger.x * SCREEN_WIDTH, event.tfinger.y * SCREEN_HEIGHT);
+                break;
+
+            case SDL_FINGERMOTION:
+                activity.nativeOnTouchMove(env, ACTIVITY_CLASS,
+                    (int)event.tfinger.fingerId, (int)event.tfinger.fingerId,
+                    event.tfinger.x * SCREEN_WIDTH, event.tfinger.y * SCREEN_HEIGHT);
+                break;
+
+            case SDL_FINGERUP:
+                activity.nativeOnTouchUp(env, ACTIVITY_CLASS,
+                    (int)event.tfinger.fingerId, (int)event.tfinger.fingerId);
+                break;
+
+            default:
+                break;
+            }
+        }
+
+        /* Poll analog axes */
+        poll_controller_axes();
+
+        /* Pump OpenSL ES audio callbacks */
+        opensles_shim_pump_callbacks();
+
+        SDL_Delay(1);
+    }
+
+    /* Clean shutdown */
+    activity.nativeOnPause(env, ACTIVITY_CLASS);
+    activity.nativeOnStop(env, ACTIVITY_CLASS);
+
+    if (g_controller) SDL_GameControllerClose(g_controller);
+    SDL_Quit();
+
+    _exit(0);
+}

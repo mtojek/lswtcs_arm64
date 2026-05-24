@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(readelf --dyn-syms /Users/mtojek/code/lswtcs_arm64/assets/libTTapp.so)",
+      "Bash(readelf -d /Users/mtojek/code/lswtcs_arm64/assets/libTTapp.so)",
+      "Bash(objdump -p /Users/mtojek/code/lswtcs_arm64/assets/libTTapp.so)",
+      "Bash(make compile:*)",
+      "Bash(python3:*)",
+      "Bash(aarch64-linux-gnu-objdump -d libpthread-2.33.so)",
+      "Bash(make)",
+      "Bash(docker run:*)",
+      "Bash(brew list:*)",
+      "Bash(rizin:*)"
+    ]
+  }
+}

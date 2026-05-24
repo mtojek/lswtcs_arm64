@@ -53,3 +53,10 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# Build
+build/
+
+# Game assets (not redistributable)
+assets/*.so
+assets/*.dat
