@@ -398,6 +398,22 @@ static void patch_disable_touch_controls(void) {
                 (void *)flag, old, *flag);
 }
 
+static void patch_skip_press_start_overlay(void) {
+    /* The game has a global flag "isPressedStart" that controls the
+       "Press the START button" overlay.  On a gamepad-only device the
+       touch-based dismissal never fires.  Force the flag to 1. */
+    uintptr_t addr = so_find_addr_safe("isPressedStart");
+    if (!addr) {
+        debugPrintf("Patch: isPressedStart not found, skipping\n");
+        return;
+    }
+    uint8_t *flag = (uint8_t *)addr;
+    int old = *flag;
+    *flag = 1;
+    debugPrintf("Patch: isPressedStart at %p -> 1 (old=%d)\n",
+                (void *)flag, old);
+}
+
 static void patch_nupadupdatepads_skip_activation_gate(void) {
     uintptr_t addr = so_find_addr_safe("NuPadUpdatePads");
     if (!addr) {
@@ -852,6 +868,7 @@ int main(int argc, char *argv[]) {
     patch_endcriticalsectiongl_force_release();
     patch_gl_constant_setter_table();
     patch_disable_touch_controls();
+    patch_skip_press_start_overlay();
     patch_nupadupdatepads_skip_activation_gate();
     patch_force_primary_gamepad_mapping();
 
