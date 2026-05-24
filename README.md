@@ -8,7 +8,7 @@ Loads the original `libTTapp.so` from the Android APK and runs it natively on Li
 
 ## Screenshots
 
-<img src="screenshots/lsw-1.jpeg" width="50%"> <img src="screenshots/lsw-2.jpeg" width="50%">
+<img src="screenshots/lsw-1.jpeg" width="49%"> <img src="screenshots/lsw-2.jpeg" width="49%">
 
 ## Requirements
 
