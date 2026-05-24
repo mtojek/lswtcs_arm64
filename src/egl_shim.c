@@ -221,9 +221,9 @@ EGLBoolean egl_shim_MakeCurrent(EGLDisplay dpy, EGLSurface draw,
     has_real_gl = 1;
     static _Thread_local int acq_log = 0;
     if (acq_log < 20 || mc % 500 == 0) {
-      debugPrintf("egl_shim: MakeCurrent #%d %s [tid=%lx] ACQUIRED [ctx_id=%d]\n",
-                  mc, is_window ? "WINDOW" : "PBUFFER",
-                  (unsigned long)pthread_self(), context->id);
+      //debugPrintf("egl_shim: MakeCurrent #%d %s [tid=%lx] ACQUIRED [ctx_id=%d]\n",
+      //            mc, is_window ? "WINDOW" : "PBUFFER",
+      //            (unsigned long)pthread_self(), context->id);
       acq_log++;
     }
   } else {
@@ -244,8 +244,8 @@ EGLBoolean egl_shim_SwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     SDL_GL_SwapWindow(egl_window);
     int fc = ++frame_count;
     if (fc <= 10 || fc % 60 == 0) {
-      debugPrintf("egl_shim: SwapBuffers #%d [tid=%lx]\n",
-                  fc, (unsigned long)pthread_self());
+      //debugPrintf("egl_shim: SwapBuffers #%d [tid=%lx]\n",
+      //            fc, (unsigned long)pthread_self());
     }
   } else {
     static int noswap_log = 0;

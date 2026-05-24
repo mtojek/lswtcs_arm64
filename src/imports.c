@@ -849,8 +849,8 @@ static void glDrawArrays_wrap(GLenum mode, GLint first, GLsizei count) {
   egl_shim_ensure_current();
   static _Thread_local int draw_log_count = 0;
   if (draw_log_count < 40 || draw_log_count % 200 == 0) {
-    debugPrintf("GL: glDrawArrays(0x%x, first=%d, count=%d)\n",
-                mode, first, count);
+    //debugPrintf("GL: glDrawArrays(0x%x, first=%d, count=%d)\n",
+    //            mode, first, count);
   }
   draw_log_count++;
   glDrawArrays(mode, first, count);
