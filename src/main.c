@@ -398,6 +398,24 @@ static void patch_disable_touch_controls(void) {
                 (void *)flag, old, *flag);
 }
 
+static void patch_nupadupdatepads_skip_activation_gate(void) {
+    uintptr_t addr = so_find_addr_safe("NuPadUpdatePads");
+    if (!addr) {
+        debugPrintf("Patch: NuPadUpdatePads not found, skipping activation-gate patch\n");
+        return;
+    }
+
+    /* NuPadUpdatePads+0x294:
+       tbz w9, #0, <not-yet-activated path>
+       Skip this gate so the first frontend screen uses the same active-pad
+       path as the rest of the menus. */
+    uint32_t *branch = (uint32_t *)(addr + 0x294);
+    uint32_t old = *branch;
+    *branch = 0xd503201f; /* NOP */
+    debugPrintf("Patch: disabled NuPadUpdatePads activation gate at %p (old=0x%08x)\n",
+                (void *)branch, old);
+}
+
 typedef struct {
     int pad;
     int port;
@@ -406,6 +424,8 @@ typedef struct {
 
 static NuPadMapping *g_nupad_mapping = NULL;
 static int g_nupad_mapping_logged = 0;
+static int g_pending_activation_press = 0;
+static int g_pending_activation_release = 0;
 
 static void patch_force_primary_gamepad_mapping(void) {
     uintptr_t addr = so_find_addr_safe("g_nupadMapping");
@@ -586,6 +606,7 @@ static float g_last_rx = 0.0f;
 static float g_last_ry = 0.0f;
 static int g_last_l2_down = 0;
 static int g_last_r2_down = 0;
+static int g_request_quit = 0;
 static uint8_t g_button_states[SDL_CONTROLLER_BUTTON_MAX];
 
 #define STICK_DEADZONE   8000
@@ -626,6 +647,35 @@ static void send_native_gamepad_axes(void *env, float hat_x, float hat_y,
     activity.nativeUpdateGamepadAxisValues(env, ACTIVITY_CLASS, hat_x, hat_y, lx, ly, rx, ry);
 }
 
+static void queue_gamepad_activation_pulse(void) {
+    g_pending_activation_press = 1;
+    g_pending_activation_release = 0;
+}
+
+static void pump_gamepad_activation_pulse(void) {
+    if (!g_controller) {
+        return;
+    }
+
+    void *env = &g_jni_env;
+
+    if (g_pending_activation_press) {
+        debugPrintf("Input: synthetic activation pulse DOWN\n");
+        send_native_key_down(env, AKEYCODE_BUTTON_A, "activation_pulse");
+        g_pending_activation_press = 0;
+        g_pending_activation_release = 3;
+        return;
+    }
+
+    if (g_pending_activation_release > 0) {
+        g_pending_activation_release--;
+        if (g_pending_activation_release == 0) {
+            debugPrintf("Input: synthetic activation pulse UP\n");
+            send_native_key_up(env, AKEYCODE_BUTTON_A, "activation_pulse");
+        }
+    }
+}
+
 static void open_controller(void) {
     int num_joysticks = SDL_NumJoysticks();
     debugPrintf("Input: SDL_NumJoysticks() = %d\n", num_joysticks);
@@ -640,6 +690,7 @@ static void open_controller(void) {
             if (g_controller) {
                 memset(g_button_states, 0, sizeof(g_button_states));
                 debugPrintf("Controller opened: %s\n", SDL_GameControllerName(g_controller));
+                queue_gamepad_activation_pulse();
                 return;
             } else {
                 debugPrintf("Input: SDL_GameControllerOpen(%d) failed: %s\n",
@@ -655,6 +706,15 @@ static void poll_controller_buttons(void) {
     if (!g_controller) return;
 
     void *env = &g_jni_env;
+    uint8_t guide_down = SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_GUIDE) ? 1 : 0;
+
+    if (guide_down != g_button_states[SDL_CONTROLLER_BUTTON_GUIDE]) {
+        g_button_states[SDL_CONTROLLER_BUTTON_GUIDE] = guide_down;
+        debugPrintf("Input: guide/menu button %s\n", guide_down ? "DOWN" : "UP");
+        if (guide_down) {
+            g_request_quit = 1;
+        }
+    }
 
     for (int i = 0; i < (int)(sizeof(button_map) / sizeof(button_map[0])); i++) {
         SDL_GameControllerButton button = button_map[i].sdl_button;
@@ -792,6 +852,7 @@ int main(int argc, char *argv[]) {
     patch_endcriticalsectiongl_force_release();
     patch_gl_constant_setter_table();
     patch_disable_touch_controls();
+    patch_nupadupdatepads_skip_activation_gate();
     patch_force_primary_gamepad_mapping();
 
     /* Finalize: make text read-only+exec, flush caches */
@@ -948,9 +1009,15 @@ int main(int argc, char *argv[]) {
         /* Android frontend path can keep trying to remap back to touch-first.
            Keep logical pad 0 bound to the physical gamepad port. */
         maintain_primary_gamepad_mapping();
+        pump_gamepad_activation_pulse();
 
         /* Pump OpenSL ES audio callbacks */
         opensles_shim_pump_callbacks();
+
+        if (g_request_quit) {
+            debugPrintf("Input: guide/menu requested quit\n");
+            running = 0;
+        }
 
         SDL_Delay(1);
     }
