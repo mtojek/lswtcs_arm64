@@ -171,6 +171,219 @@ static void tt_activity_on_create(void) {
     debugPrintf("TTActivity: nativeOnCreate done\n");
 }
 
+static void patch_nurenderdevice_initialize_stack_check(void) {
+    uintptr_t init_addr = so_find_addr("_ZN14NuRenderDevice10InitializeEv");
+    if (!init_addr) {
+        debugPrintf("Patch: NuRenderDevice::Initialize not found, skipping canary workaround\n");
+        return;
+    }
+
+    /* libTTapp.so+0x5cf130: `b.ne 0x5cf150` -> false-positive stack canary trip
+       on this wrapper path. NOP it so the function can return normally. */
+    uint32_t *branch = (uint32_t *)(init_addr + 0x404);
+    uint32_t old = *branch;
+    *branch = 0xd503201f; /* NOP */
+    debugPrintf("Patch: disabled NuRenderDevice::Initialize stack-check branch at %p (old=0x%08x)\n",
+                (void *)branch, old);
+}
+
+static void patch_nurenderdevice_initialise_openglcontext_stack_check(void) {
+    uintptr_t initgl_addr =
+        so_find_addr("_ZN14NuRenderDevice23InitialiseOpenGLContextEP13ANativeWindow");
+    if (!initgl_addr) {
+        debugPrintf("Patch: NuRenderDevice::InitialiseOpenGLContext not found, skipping canary workaround\n");
+        return;
+    }
+
+    /* libTTapp.so+0x5cf9d4: `b.ne 0x5cf9f0` -> false-positive stack canary trip
+       on this wrapper path. NOP it so the function can return normally.
+       Symbol base is 0x5cf43c, so the branch sits at +0x598. */
+    uint32_t *branch = (uint32_t *)(initgl_addr + 0x598);
+    uint32_t old = *branch;
+    *branch = 0xd503201f; /* NOP */
+    debugPrintf("Patch: disabled NuRenderDevice::InitialiseOpenGLContext stack-check branch at %p (old=0x%08x)\n",
+                (void *)branch, old);
+}
+
+static void patch_nupostfilter_initsharedresources_stack_check(void) {
+    uint32_t *branch = (uint32_t *)((uintptr_t)text_base + 0x5ce1c4);
+    uint32_t old = *branch;
+    *branch = 0xd503201f; /* NOP */
+    debugPrintf("Patch: disabled NuPostFilter::initSharedResources stack-check branch at %p (old=0x%08x)\n",
+                (void *)branch, old);
+}
+
+static void patch_numtlinitex_stack_check(void) {
+    uint32_t *branch = (uint32_t *)((uintptr_t)text_base + 0x5be37c);
+    uint32_t old = *branch;
+    *branch = 0xd503201f; /* NOP */
+    debugPrintf("Patch: disabled NuMtlInitEx stack-check branch at %p (old=0x%08x)\n",
+                (void *)branch, old);
+}
+
+static void patch_loaddefaulttexture_stack_check(void) {
+    uint32_t *branch = (uint32_t *)((uintptr_t)text_base + 0x5c7bac);
+    uint32_t old = *branch;
+    *branch = 0xd503201f; /* NOP */
+    debugPrintf("Patch: disabled loadDefaultTexture stack-check branch at %p (old=0x%08x)\n",
+                (void *)branch, old);
+}
+
+static void patch_nuqfntreadbuffer_stack_check(void) {
+    uint32_t *branch = (uint32_t *)((uintptr_t)text_base + 0x597eb8);
+    uint32_t old = *branch;
+    *branch = 0xd503201f; /* NOP */
+    debugPrintf("Patch: disabled NuQFntReadBuffer stack-check branch at %p (old=0x%08x)\n",
+                (void *)branch, old);
+}
+
+static void patch_nuinithardware_stack_check(void) {
+    uint32_t *branch = (uint32_t *)((uintptr_t)text_base + 0x60310c);
+    uint32_t old = *branch;
+    *branch = 0xd503201f; /* NOP */
+    debugPrintf("Patch: disabled NuInitHardware stack-check branch at %p (old=0x%08x)\n",
+                (void *)branch, old);
+}
+
+static void patch_nuframeend_stack_check(void) {
+    uint32_t *branch = (uint32_t *)((uintptr_t)text_base + 0x603ce0);
+    uint32_t old = *branch;
+    *branch = 0xd503201f; /* NOP */
+    debugPrintf("Patch: disabled NuFrameEnd stack-check branch at %p (old=0x%08x)\n",
+                (void *)branch, old);
+}
+
+static intptr_t sign_extend_bits(uint32_t value, int bits) {
+    uint32_t sign_bit = 1u << (bits - 1);
+    uint32_t mask = (1u << bits) - 1u;
+    value &= mask;
+    return (intptr_t)((value ^ sign_bit) - sign_bit);
+}
+
+static int decode_b_cond_target(uintptr_t pc, uint32_t insn, uintptr_t *target) {
+    if ((insn & 0xff000010u) != 0x54000000u) {
+        return 0;
+    }
+
+    intptr_t imm = sign_extend_bits((insn >> 5) & 0x7ffffu, 19) << 2;
+    *target = pc + imm;
+    return 1;
+}
+
+static int decode_cbz_target(uintptr_t pc, uint32_t insn, uintptr_t *target) {
+    uint32_t op = insn & 0x7e000000u;
+    if (op != 0x34000000u && op != 0x35000000u) {
+        return 0;
+    }
+
+    intptr_t imm = sign_extend_bits((insn >> 5) & 0x7ffffu, 19) << 2;
+    *target = pc + imm;
+    return 1;
+}
+
+static uintptr_t decode_bl_target(uintptr_t pc, uint32_t insn) {
+    intptr_t imm = sign_extend_bits(insn & 0x03ffffffu, 26) << 2;
+    return pc + imm;
+}
+
+static void patch_all_stack_chk_branches(void) {
+    if (!text_base || text_size < 4) {
+        debugPrintf("Patch: text not ready, skipping global stack-check workaround\n");
+        return;
+    }
+
+    uintptr_t fail_plt = (uintptr_t)text_base + 0x1c5c40;
+    uint32_t *words = (uint32_t *)text_base;
+    size_t count = text_size / sizeof(uint32_t);
+    int patched = 0;
+    int missed = 0;
+
+    for (size_t i = 0; i < count; i++) {
+        uint32_t insn = words[i];
+        uintptr_t pc = (uintptr_t)&words[i];
+
+        if ((insn & 0xfc000000u) != 0x94000000u) {
+            continue;
+        }
+        if (decode_bl_target(pc, insn) != fail_plt) {
+            continue;
+        }
+
+        int found = 0;
+        for (size_t back = 1; back <= 16 && back <= i; back++) {
+            uintptr_t branch_target = 0;
+            uintptr_t branch_pc = (uintptr_t)&words[i - back];
+            uint32_t branch_insn = words[i - back];
+
+            if (!decode_b_cond_target(branch_pc, branch_insn, &branch_target) &&
+                !decode_cbz_target(branch_pc, branch_insn, &branch_target)) {
+                continue;
+            }
+
+            if (branch_target == pc) {
+                words[i - back] = 0xd503201f; /* NOP */
+                patched++;
+                found = 1;
+                break;
+            }
+        }
+
+        if (!found) {
+            missed++;
+            if (missed <= 5) {
+                debugPrintf("Patch: missed stack-check branch for call at libTTapp.so+0x%lx\n",
+                            (unsigned long)(pc - (uintptr_t)text_base));
+            }
+        }
+    }
+
+    debugPrintf("Patch: disabled %d stack-check branches to __stack_chk_fail@plt (missed %d)\n",
+                patched, missed);
+}
+
+static void patch_endcriticalsectiongl_force_release(void) {
+    uintptr_t end_addr = so_find_addr("EndCriticalSectionGL");
+    if (!end_addr) {
+        debugPrintf("Patch: EndCriticalSectionGL not found, skipping forced GL release patch\n");
+        return;
+    }
+
+    /* On this SDL/EGL stack we still need the outermost EndCriticalSectionGL
+       to drop the current context, otherwise the render thread hits
+       EGL_BAD_ACCESS when trying to acquire the window context. */
+    uint32_t *branch = (uint32_t *)(end_addr + 0x28);
+    uint32_t old = *branch;
+    *branch = 0x1400000f; /* b +0x3c -> jump to 0x5d010c */
+    debugPrintf("Patch: forced EndCriticalSectionGL to unbind EGL context at %p (old=0x%08x)\n",
+                (void *)branch, old);
+}
+
+static void patch_gl_constant_setter_table(void) {
+    uintptr_t table_addr = so_find_addr_safe("g_glConstantSetterTable");
+    if (!table_addr) {
+        debugPrintf("Patch: g_glConstantSetterTable not found, skipping uniform setter table patch\n");
+        return;
+    }
+
+    uintptr_t *table = (uintptr_t *)table_addr;
+    uintptr_t old0 = table[0];
+    uintptr_t old1 = table[1];
+    uintptr_t old2 = table[2];
+    uintptr_t old3 = table[3];
+
+    table[0] = (uintptr_t)&glUniform1fv_wrap;
+    table[1] = (uintptr_t)&glUniform2fv_wrap;
+    table[2] = (uintptr_t)&glUniform3fv_wrap;
+    table[3] = (uintptr_t)&glUniform4fv_wrap;
+
+    debugPrintf("Patch: patched g_glConstantSetterTable at %p\n",
+                (void *)table);
+    debugPrintf("Patch: uniform setters old=[%p %p %p %p] new=[%p %p %p %p]\n",
+                (void *)old0, (void *)old1, (void *)old2, (void *)old3,
+                (void *)table[0], (void *)table[1], (void *)table[2],
+                (void *)table[3]);
+}
+
 /* Crash handler — just dump and exit (no recovery, like Vita) */
 static void crash_handler(int sig, siginfo_t *info, void *uctx) {
     ucontext_t *uc = (ucontext_t *)uctx;
@@ -372,6 +585,18 @@ int main(int argc, char *argv[]) {
     debugPrintf("Resolving %zu imports...\n", dynlib_numfunctions);
     if (so_resolve(dynlib_functions, dynlib_numfunctions, 0) < 0)
         fatal_error("Failed to resolve imports");
+
+    patch_nurenderdevice_initialize_stack_check();
+    patch_nurenderdevice_initialise_openglcontext_stack_check();
+    patch_nupostfilter_initsharedresources_stack_check();
+    patch_numtlinitex_stack_check();
+    patch_loaddefaulttexture_stack_check();
+    patch_nuqfntreadbuffer_stack_check();
+    patch_nuinithardware_stack_check();
+    patch_nuframeend_stack_check();
+    patch_all_stack_chk_branches();
+    patch_endcriticalsectiongl_force_release();
+    patch_gl_constant_setter_table();
 
     /* Finalize: make text read-only+exec, flush caches */
     so_finalize();

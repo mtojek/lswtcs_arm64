@@ -1,19 +1,8 @@
 /*
  * egl_shim.c -- EGL wrapper backed by SDL2 (OpenGL ES 2.0)
  *
- * PowerVR GE8300: only ONE GL context can be current at a time, period.
- *
- * Game architecture:
- *   - AndroidMain: holds GL for entire critical sections (loading/frame prep)
- *   - renderThread_main: does all rendering inside critical sections
- *   - BeginCriticalSectionGL: locks recursive mutex2, calls eglMakeCurrent
- *     on first entry (lock_count 0→1)
- *   - EndCriticalSectionGL: decrements lock_count, unlocks mutex2,
- *     but NEVER calls eglMakeCurrent(NULL) — each thread keeps its context
- *
- * Strategy: Single SDL GL context. Hook pthread_mutex_unlock to detect
- * outermost EndCriticalSectionGL. Release GL at that point so the other
- * thread can acquire it. The game's own mutex2 serializes all GL access.
+ * Each fake EGL context gets a real SDL GL context. We keep a bootstrap
+ * context around as the share root so all contexts can share resources.
  */
 
 #include <SDL2/SDL.h>
@@ -29,26 +18,20 @@
 #define SCREEN_HEIGHT 720
 
 typedef struct {
+  SDL_GLContext sdl_context;
   EGLBoolean is_pbuffer;
+  int id;
 } _egl_context;
 
 static SDL_Window *egl_window = NULL;
-static SDL_GLContext egl_sdl_context = NULL;
-
-/* GL ownership tracking */
-static pthread_mutex_t gl_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t gl_available_cond = PTHREAD_COND_INITIALIZER;
-static pthread_t gl_owner;
-static int gl_owned = 0;
+static SDL_GLContext egl_share_root = NULL;
+static pthread_mutex_t egl_context_create_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int frame_count = 0;
+static int next_context_id = 1;
 
 static _Thread_local _egl_context *current_context = NULL;
+static _Thread_local _egl_context *last_context = NULL;
 static _Thread_local int has_real_gl = 0;
-
-/* Mutex-hook state: detect outermost EndCriticalSectionGL */
-static _Thread_local void *last_locked_mutex = NULL;
-static _Thread_local void *gl_critical_mutex = NULL;
-static _Thread_local int gl_critical_depth = 0;
 
 SDL_Window *egl_shim_get_window(void) { return egl_window; }
 
@@ -74,123 +57,46 @@ void egl_shim_create_window(void) {
   }
   debugPrintf("egl_shim: Window created %dx%d\n", SCREEN_WIDTH, SCREEN_HEIGHT);
 
-  egl_sdl_context = SDL_GL_CreateContext(egl_window);
-  if (!egl_sdl_context) {
+  egl_share_root = SDL_GL_CreateContext(egl_window);
+  if (!egl_share_root) {
     debugPrintf("egl_shim: SDL_GL_CreateContext FAILED: %s\n", SDL_GetError());
     return;
   }
-  debugPrintf("egl_shim: GL context created\n");
+  debugPrintf("egl_shim: GL share-root context created\n");
 
-  /* GL test */
-  glClearColor(1.0f, 0.0f, 0.0f, 1.0f);
-  glClear(GL_COLOR_BUFFER_BIT);
-  SDL_GL_SwapWindow(egl_window);
-  debugPrintf("egl_shim: GL TEST -- RED for 2s\n");
-  SDL_Delay(2000);
-
-  glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-  glClear(GL_COLOR_BUFFER_BIT);
-  SDL_GL_SwapWindow(egl_window);
-
-  /* Release context for game threads */
   SDL_GL_MakeCurrent(egl_window, NULL);
   debugPrintf("egl_shim: Context released, ready for game\n");
-}
-
-/* Acquire GL for the calling thread. Waits if another thread has it. */
-static int gl_acquire(const char *surf_type, int mc) {
-  pthread_mutex_lock(&gl_mutex);
-
-  if (gl_owned && pthread_equal(gl_owner, pthread_self())) {
-    /* Already own it */
-    pthread_mutex_unlock(&gl_mutex);
-    has_real_gl = 1;
-    return 1;
-  }
-
-  /* Wait for GL to become free */
-  int waited = 0;
-  while (gl_owned) {
-    if (!waited) {
-      debugPrintf("egl_shim: MakeCurrent #%d %s [tid=%lx] waiting (GL held by %lx)\n",
-                  mc, surf_type, (unsigned long)pthread_self(), (unsigned long)gl_owner);
-    }
-    waited = 1;
-    pthread_cond_wait(&gl_available_cond, &gl_mutex);
-  }
-
-  /* GL is free — bind it to this thread */
-  int ret = SDL_GL_MakeCurrent(egl_window, egl_sdl_context);
-  if (ret == 0) {
-    gl_owned = 1;
-    gl_owner = pthread_self();
-    has_real_gl = 1;
-    pthread_mutex_unlock(&gl_mutex);
-    static _Thread_local int acq_log = 0;
-    if (acq_log < 10 || mc % 500 == 0) {
-      debugPrintf("egl_shim: MakeCurrent #%d %s [tid=%lx] ACQUIRED%s\n",
-                  mc, surf_type, (unsigned long)pthread_self(),
-                  waited ? " (after wait)" : "");
-      acq_log++;
-    }
-    return 1;
-  } else {
-    pthread_mutex_unlock(&gl_mutex);
-    has_real_gl = 0;
-    debugPrintf("egl_shim: MakeCurrent #%d %s [tid=%lx] SDL FAILED: %s\n",
-                mc, surf_type, (unsigned long)pthread_self(), SDL_GetError());
-    return 0;
-  }
-}
-
-/* Release GL from the calling thread and wake waiters. */
-static void gl_release(const char *reason) {
-  pthread_mutex_lock(&gl_mutex);
-  if (gl_owned && pthread_equal(gl_owner, pthread_self())) {
-    SDL_GL_MakeCurrent(egl_window, NULL);
-    gl_owned = 0;
-    has_real_gl = 0;
-    pthread_cond_broadcast(&gl_available_cond);
-    static int rel_log = 0;
-    if (rel_log < 20 || frame_count % 120 == 0) {
-      debugPrintf("egl_shim: GL released [tid=%lx] reason=%s\n",
-                  (unsigned long)pthread_self(), reason);
-      rel_log++;
-    }
-  }
-  pthread_mutex_unlock(&gl_mutex);
 }
 
 /* --- Mutex hooks (called from imports.c pthread wrappers) --- */
 
 void egl_shim_on_mutex_post_lock(void *mutex_id) {
-  last_locked_mutex = mutex_id;
-  if (gl_critical_mutex && mutex_id == gl_critical_mutex) {
-    gl_critical_depth++;
-    static _Thread_local int lock_log = 0;
-    if (lock_log < 10) {
-      debugPrintf("egl_shim: mutex_hook lock depth=%d [tid=%lx] mutex=%p\n",
-                  gl_critical_depth, (unsigned long)pthread_self(), mutex_id);
-      lock_log++;
-    }
-  }
+  (void)mutex_id;
 }
 
 void egl_shim_on_mutex_pre_unlock(void *mutex_id) {
-  if (gl_critical_mutex && mutex_id == gl_critical_mutex) {
-    gl_critical_depth--;
-    static _Thread_local int unlock_log = 0;
-    if (unlock_log < 10) {
-      debugPrintf("egl_shim: mutex_hook unlock depth=%d [tid=%lx] mutex=%p\n",
-                  gl_critical_depth, (unsigned long)pthread_self(), mutex_id);
-      unlock_log++;
-    }
-    if (gl_critical_depth == 0) {
-      /* Outermost EndCriticalSectionGL — release GL */
-      gl_release("EndCriticalSection");
-      gl_critical_mutex = NULL;
-    }
+  (void)mutex_id;
+}
+
+int egl_shim_ensure_current(void) {
+  if (has_real_gl)
+    return 1;
+  _egl_context *ctx = current_context ? current_context : last_context;
+  if (!egl_window || !ctx || !ctx->sdl_context)
+    return 0;
+
+  int ret = SDL_GL_MakeCurrent(egl_window, ctx->sdl_context);
+  if (ret == 0) {
+    has_real_gl = 1;
+    current_context = ctx;
+    debugPrintf("egl_shim: restored current context [tid=%lx] [ctx_id=%d]\n",
+                (unsigned long)pthread_self(), ctx->id);
+    return 1;
   }
+
+  debugPrintf("egl_shim: failed to restore current context [tid=%lx] [ctx_id=%d]: %s\n",
+              (unsigned long)pthread_self(), ctx->id, SDL_GetError());
+  return 0;
 }
 
 /* --- EGL API --- */
@@ -212,9 +118,9 @@ EGLBoolean egl_shim_Initialize(EGLDisplay dpy, EGLint *major, EGLint *minor) {
 EGLBoolean egl_shim_Terminate(EGLDisplay dpy) {
   (void)dpy;
   debugPrintf("egl_shim: eglTerminate()\n");
-  if (egl_sdl_context) {
-    SDL_GL_DeleteContext(egl_sdl_context);
-    egl_sdl_context = NULL;
+  if (egl_share_root) {
+    SDL_GL_DeleteContext(egl_share_root);
+    egl_share_root = NULL;
   }
   if (egl_window) {
     SDL_DestroyWindow(egl_window);
@@ -256,9 +162,30 @@ EGLContext egl_shim_CreateContext(EGLDisplay dpy, EGLConfig config,
                                   EGLContext share_context,
                                   const EGLint *attrib_list) {
   (void)dpy; (void)config; (void)share_context; (void)attrib_list;
-  EGLContext c = (EGLContext)calloc(1, sizeof(_egl_context));
-  debugPrintf("egl_shim: eglCreateContext(share=%p) -> %p\n", share_context, c);
-  return c;
+  _egl_context *c = (_egl_context *)calloc(1, sizeof(_egl_context));
+  if (!c)
+    return EGL_NO_CONTEXT;
+
+  pthread_mutex_lock(&egl_context_create_mutex);
+  SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 1);
+  if (egl_share_root)
+    SDL_GL_MakeCurrent(egl_window, egl_share_root);
+  c->sdl_context = SDL_GL_CreateContext(egl_window);
+  SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 0);
+  SDL_GL_MakeCurrent(egl_window, NULL);
+  pthread_mutex_unlock(&egl_context_create_mutex);
+
+  if (!c->sdl_context) {
+    debugPrintf("egl_shim: eglCreateContext(share=%p) FAILED: %s\n",
+                share_context, SDL_GetError());
+    free(c);
+    return EGL_NO_CONTEXT;
+  }
+
+  c->id = next_context_id++;
+  debugPrintf("egl_shim: eglCreateContext(share=%p) -> %p [ctx_id=%d]\n",
+              share_context, c, c->id);
+  return (EGLContext)c;
 }
 
 EGLBoolean egl_shim_MakeCurrent(EGLDisplay dpy, EGLSurface draw,
@@ -272,10 +199,11 @@ EGLBoolean egl_shim_MakeCurrent(EGLDisplay dpy, EGLSurface draw,
   /* === UNBIND === */
   if (context == NULL || draw == NULL) {
     current_context = NULL;
-    gl_critical_mutex = NULL;
-    gl_critical_depth = 0;
-    if (egl_window)
-      gl_release("eglMakeCurrent(NULL)");
+    if (egl_window) {
+      SDL_GL_MakeCurrent(egl_window, NULL);
+      debugPrintf("egl_shim: GL released [tid=%lx] reason=eglMakeCurrent(NULL)\n",
+                  (unsigned long)pthread_self());
+    }
     has_real_gl = 0;
     return EGL_TRUE;
   }
@@ -283,24 +211,26 @@ EGLBoolean egl_shim_MakeCurrent(EGLDisplay dpy, EGLSurface draw,
   int is_window = (((char *)draw)[0] == 'w');
   context->is_pbuffer = is_window ? EGL_FALSE : EGL_TRUE;
   current_context = context;
+  last_context = context;
 
-  if (!egl_window || !egl_sdl_context)
+  if (!egl_window || !context->sdl_context)
     return EGL_TRUE;
 
-  /* Acquire GL (waits if another thread has it) */
-  gl_acquire(is_window ? "WINDOW" : "PBUFFER", mc);
-
-  /* Track this thread's critical section depth.
-   * BeginCriticalSectionGL locks mutex2 THEN calls eglMakeCurrent.
-   * So last_locked_mutex is mutex2's address. */
-  if (gl_critical_mutex == NULL && last_locked_mutex != NULL) {
-    gl_critical_mutex = last_locked_mutex;
-    gl_critical_depth = 1;
-    debugPrintf("egl_shim: tracking mutex %p as GL critical section [tid=%lx]\n",
-                gl_critical_mutex, (unsigned long)pthread_self());
-  } else if (gl_critical_mutex == NULL) {
-    debugPrintf("egl_shim: WARNING no last_locked_mutex for GL tracking [tid=%lx]\n",
-                (unsigned long)pthread_self());
+  int ret = SDL_GL_MakeCurrent(egl_window, context->sdl_context);
+  if (ret == 0) {
+    has_real_gl = 1;
+    static _Thread_local int acq_log = 0;
+    if (acq_log < 20 || mc % 500 == 0) {
+      debugPrintf("egl_shim: MakeCurrent #%d %s [tid=%lx] ACQUIRED [ctx_id=%d]\n",
+                  mc, is_window ? "WINDOW" : "PBUFFER",
+                  (unsigned long)pthread_self(), context->id);
+      acq_log++;
+    }
+  } else {
+    has_real_gl = 0;
+    debugPrintf("egl_shim: MakeCurrent #%d %s [tid=%lx] SDL FAILED [ctx_id=%d]: %s\n",
+                mc, is_window ? "WINDOW" : "PBUFFER",
+                (unsigned long)pthread_self(), context->id, SDL_GetError());
   }
 
   return EGL_TRUE;
@@ -310,7 +240,7 @@ EGLBoolean egl_shim_SwapBuffers(EGLDisplay dpy, EGLSurface surface) {
   (void)dpy; (void)surface;
   if (!egl_window) return EGL_TRUE;
 
-  if (has_real_gl) {
+  if (has_real_gl && current_context && !current_context->is_pbuffer) {
     SDL_GL_SwapWindow(egl_window);
     int fc = ++frame_count;
     if (fc <= 10 || fc % 60 == 0) {
@@ -336,7 +266,12 @@ EGLBoolean egl_shim_DestroySurface(EGLDisplay dpy, EGLSurface surface) {
 
 EGLBoolean egl_shim_DestroyContext(EGLDisplay dpy, EGLContext ctx) {
   (void)dpy;
-  free(ctx);
+  _egl_context *context = (_egl_context *)ctx;
+  if (context) {
+    if (context->sdl_context)
+      SDL_GL_DeleteContext(context->sdl_context);
+    free(context);
+  }
   return EGL_TRUE;
 }
 

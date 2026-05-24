@@ -33,13 +33,18 @@ void *AAssetManager_open_fake(void *mgr, const char *filename, int mode) {
   (void)mode;
 
   char path[1024];
-  snprintf(path, sizeof(path), "%s/%s", g_data_path, filename);
+  if (filename && filename[0] == '/') {
+    snprintf(path, sizeof(path), "%s", filename);
+  } else {
+    snprintf(path, sizeof(path), "%s/%s", g_data_path, filename);
+  }
+  const char *resolved = resolve_android_path(path);
 
-  debugPrintf("AAssetManager_open: %s\n", path);
+  debugPrintf("AAssetManager_open: %s -> %s\n", path, resolved);
 
-  FILE *fp = fopen(path, "rb");
+  FILE *fp = fopen(resolved, "rb");
   if (!fp) {
-    debugPrintf("AAssetManager_open: FAILED to open %s\n", path);
+    debugPrintf("AAssetManager_open: FAILED to open %s\n", resolved);
     return NULL;
   }
 

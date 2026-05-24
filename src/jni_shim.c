@@ -41,6 +41,11 @@ static char g_country_code[] = "US";
 static char g_window_service[] = "window";
 static int g_sdk_int = 21;
 
+typedef struct {
+  jint length;
+  void **elements;
+} FakeObjectArray;
+
 /* Default stub */
 static void *jni_stub(void) { return NULL; }
 static int jni_stub_int(void) { return 0; }
@@ -187,6 +192,52 @@ static int GetStringUTFLength(void *env, jstring str) {
   return (int)strlen((const char *)str);
 }
 
+static jint GetArrayLength(void *env, jobjectArray array) {
+  (void)env;
+  FakeObjectArray *arr = (FakeObjectArray *)array;
+  if (!arr)
+    return 0;
+  return arr->length;
+}
+
+static jobjectArray NewObjectArray(void *env, jint length, jclass elementClass,
+                                   jobject initialElement) {
+  (void)env;
+  (void)elementClass;
+  FakeObjectArray *arr = calloc(1, sizeof(*arr));
+  if (!arr)
+    return NULL;
+  arr->length = length;
+  if (length > 0) {
+    arr->elements = calloc((size_t)length, sizeof(void *));
+    if (!arr->elements) {
+      free(arr);
+      return NULL;
+    }
+    for (jint i = 0; i < length; i++) {
+      arr->elements[i] = initialElement;
+    }
+  }
+  return (jobjectArray)arr;
+}
+
+static jobject GetObjectArrayElement(void *env, jobjectArray array, jint index) {
+  (void)env;
+  FakeObjectArray *arr = (FakeObjectArray *)array;
+  if (!arr || index < 0 || index >= arr->length || !arr->elements)
+    return NULL;
+  return (jobject)arr->elements[index];
+}
+
+static void SetObjectArrayElement(void *env, jobjectArray array, jint index,
+                                  jobject value) {
+  (void)env;
+  FakeObjectArray *arr = (FakeObjectArray *)array;
+  if (!arr || index < 0 || index >= arr->length || !arr->elements)
+    return;
+  arr->elements[index] = value;
+}
+
 /* GetJavaVM */
 static jint GetJavaVM(void *env, void **vm) {
   if (vm) *vm = &g_jni_vm;
@@ -259,10 +310,10 @@ void jni_shim_init(void) {
   jni_vtable[168] = (void *)GetStringUTFLength;     // GetStringUTFLength
   jni_vtable[169] = (void *)GetStringUTFChars;      // GetStringUTFChars
   jni_vtable[170] = (void *)ReleaseStringUTFChars;  // ReleaseStringUTFChars
-  jni_vtable[171] = (void *)jni_stub_int;           // GetArrayLength
-  jni_vtable[172] = (void *)jni_stub;               // NewObjectArray
-  jni_vtable[173] = (void *)jni_stub;               // GetObjectArrayElement
-  jni_vtable[174] = (void *)jni_stub;               // SetObjectArrayElement
+  jni_vtable[171] = (void *)GetArrayLength;         // GetArrayLength
+  jni_vtable[172] = (void *)NewObjectArray;         // NewObjectArray
+  jni_vtable[173] = (void *)GetObjectArrayElement;  // GetObjectArrayElement
+  jni_vtable[174] = (void *)SetObjectArrayElement;  // SetObjectArrayElement
   jni_vtable[214] = (void *)jni_stub_int;           // RegisterNatives → return 0 (JNI_OK)
   jni_vtable[219] = (void *)GetJavaVM;              // GetJavaVM (offset 1752)
   jni_vtable[227] = (void *)ExceptionCheck;         // ExceptionCheck

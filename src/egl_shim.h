@@ -66,5 +66,6 @@ void egl_shim_create_window(void);
 // to detect outermost EndCriticalSectionGL and release GL
 void egl_shim_on_mutex_post_lock(void *mutex_id);
 void egl_shim_on_mutex_pre_unlock(void *mutex_id);
+int egl_shim_ensure_current(void);
 
 #endif

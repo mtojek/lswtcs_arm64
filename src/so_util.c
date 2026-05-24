@@ -372,6 +372,15 @@ uintptr_t so_find_addr(const char *symbol) {
   return 0;
 }
 
+uintptr_t so_find_addr_safe(const char *symbol) {
+  for (int i = 0; i < num_syms; i++) {
+    char *name = dynstrtab + syms[i].st_name;
+    if (strcmp(name, symbol) == 0)
+      return (uintptr_t)text_base + syms[i].st_value;
+  }
+  return 0;
+}
+
 uintptr_t so_find_addr_rx(const char *symbol) {
   for (int i = 0; i < num_syms; i++) {
     char *name = dynstrtab + syms[i].st_name;

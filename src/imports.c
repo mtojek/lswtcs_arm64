@@ -45,13 +45,150 @@ FILE *stderr_fake = (FILE *)0x1337;
 static uint8_t fake_sF[3][0x100];
 static uint64_t __stack_chk_guard_fake = 0x4242424242424242;
 
+typedef struct HostMutexEntry {
+  void *guest_addr;
+  pthread_mutex_t mutex;
+  struct HostMutexEntry *next;
+} HostMutexEntry;
+
+typedef struct HostCondEntry {
+  void *guest_addr;
+  pthread_cond_t cond;
+  struct HostCondEntry *next;
+} HostCondEntry;
+
+static HostMutexEntry *g_mutex_entries = NULL;
+static HostCondEntry *g_cond_entries = NULL;
+static pthread_mutex_t g_mutex_registry_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_cond_registry_lock = PTHREAD_MUTEX_INITIALIZER;
+
 /* Vita-style: just log and return — no abort, no loop */
 static void __stack_chk_fail_stub(void) {
-  debugPrintf("__stack_chk_fail called from %p\n", __builtin_return_address(0));
+  uintptr_t ra = (uintptr_t)__builtin_return_address(0);
+  if (text_base && ra >= (uintptr_t)text_base &&
+      ra < (uintptr_t)text_base + text_size) {
+    debugPrintf("__stack_chk_fail called from %p (libTTapp.so+0x%lx)\n",
+                (void *)ra, (unsigned long)(ra - (uintptr_t)text_base));
+  } else if (data_base && ra >= (uintptr_t)data_base &&
+             ra < (uintptr_t)data_base + data_size) {
+    debugPrintf("__stack_chk_fail called from %p (libTTapp.so[data]+0x%lx)\n",
+                (void *)ra, (unsigned long)(ra - (uintptr_t)data_base));
+  } else {
+    debugPrintf("__stack_chk_fail called from %p\n", (void *)ra);
+  }
 }
 
 /* errno compat */
 static int *__errno_fake(void) { return &errno; }
+
+static pthread_mutex_t *lookup_host_mutex(void *guest_addr, int create) {
+  if (!guest_addr)
+    return NULL;
+
+  pthread_mutex_lock(&g_mutex_registry_lock);
+  for (HostMutexEntry *entry = g_mutex_entries; entry; entry = entry->next) {
+    if (entry->guest_addr == guest_addr) {
+      pthread_mutex_unlock(&g_mutex_registry_lock);
+      return &entry->mutex;
+    }
+  }
+
+  if (!create) {
+    pthread_mutex_unlock(&g_mutex_registry_lock);
+    return NULL;
+  }
+
+  HostMutexEntry *entry = calloc(1, sizeof(*entry));
+  if (!entry) {
+    pthread_mutex_unlock(&g_mutex_registry_lock);
+    return NULL;
+  }
+
+  pthread_mutexattr_t attr;
+  pthread_mutexattr_init(&attr);
+  pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+  pthread_mutex_init(&entry->mutex, &attr);
+  pthread_mutexattr_destroy(&attr);
+
+  entry->guest_addr = guest_addr;
+  entry->next = g_mutex_entries;
+  g_mutex_entries = entry;
+  pthread_mutex_unlock(&g_mutex_registry_lock);
+  return &entry->mutex;
+}
+
+static int destroy_host_mutex(void *guest_addr) {
+  if (!guest_addr)
+    return 0;
+
+  pthread_mutex_lock(&g_mutex_registry_lock);
+  HostMutexEntry **link = &g_mutex_entries;
+  while (*link) {
+    HostMutexEntry *entry = *link;
+    if (entry->guest_addr == guest_addr) {
+      *link = entry->next;
+      pthread_mutex_unlock(&g_mutex_registry_lock);
+      pthread_mutex_destroy(&entry->mutex);
+      free(entry);
+      return 0;
+    }
+    link = &entry->next;
+  }
+  pthread_mutex_unlock(&g_mutex_registry_lock);
+  return 0;
+}
+
+static pthread_cond_t *lookup_host_cond(void *guest_addr, int create) {
+  if (!guest_addr)
+    return NULL;
+
+  pthread_mutex_lock(&g_cond_registry_lock);
+  for (HostCondEntry *entry = g_cond_entries; entry; entry = entry->next) {
+    if (entry->guest_addr == guest_addr) {
+      pthread_mutex_unlock(&g_cond_registry_lock);
+      return &entry->cond;
+    }
+  }
+
+  if (!create) {
+    pthread_mutex_unlock(&g_cond_registry_lock);
+    return NULL;
+  }
+
+  HostCondEntry *entry = calloc(1, sizeof(*entry));
+  if (!entry) {
+    pthread_mutex_unlock(&g_cond_registry_lock);
+    return NULL;
+  }
+
+  pthread_cond_init(&entry->cond, NULL);
+  entry->guest_addr = guest_addr;
+  entry->next = g_cond_entries;
+  g_cond_entries = entry;
+  pthread_mutex_unlock(&g_cond_registry_lock);
+  return &entry->cond;
+}
+
+static int destroy_host_cond(void *guest_addr) {
+  if (!guest_addr)
+    return 0;
+
+  pthread_mutex_lock(&g_cond_registry_lock);
+  HostCondEntry **link = &g_cond_entries;
+  while (*link) {
+    HostCondEntry *entry = *link;
+    if (entry->guest_addr == guest_addr) {
+      *link = entry->next;
+      pthread_mutex_unlock(&g_cond_registry_lock);
+      pthread_cond_destroy(&entry->cond);
+      free(entry);
+      return 0;
+    }
+    link = &entry->next;
+  }
+  pthread_mutex_unlock(&g_cond_registry_lock);
+  return 0;
+}
 
 /* __android_log */
 int __android_log_print_fake(int prio, const char *tag, const char *fmt, ...) {
@@ -122,22 +259,24 @@ ssize_t __read_chk(int fd, void *buf, size_t count, size_t buf_size) {
 }
 
 int __open_2(const char *pathname, int flags) {
-  int fd = open(pathname, flags);
+  const char *resolved = resolve_android_path(pathname);
+  int fd = open(resolved, flags);
   if (strncmp(pathname, "/dev/", 5) != 0) {
-    debugPrintf("open(\"%s\", 0x%x) = %d\n", pathname, flags, fd);
+    debugPrintf("open(\"%s\" -> \"%s\", 0x%x) = %d\n", pathname, resolved, flags, fd);
   }
   return fd;
 }
 
 /* open() wrapper for debugging — skip /dev/ spam */
 int open_fake(const char *pathname, int flags, ...) {
-  int fd = open(pathname, flags);
+  const char *resolved = resolve_android_path(pathname);
+  int fd = open(resolved, flags);
   if (strncmp(pathname, "/dev/", 5) != 0) {
     if (fd >= 0)
-      debugPrintf("open(\"%s\", 0x%x) = %d\n", pathname, flags, fd);
+      debugPrintf("open(\"%s\" -> \"%s\", 0x%x) = %d\n", pathname, resolved, flags, fd);
     else
-      debugPrintf("open(\"%s\", 0x%x) = %d (errno=%d: %s)\n",
-                  pathname, flags, fd, errno, strerror(errno));
+      debugPrintf("open(\"%s\" -> \"%s\", 0x%x) = %d (errno=%d: %s)\n",
+                  pathname, resolved, flags, fd, errno, strerror(errno));
   }
   return fd;
 }
@@ -213,108 +352,91 @@ int sigaction_fake(int signum, const void *act, void *oldact) {
 
 /* fopen wrapper for debugging */
 FILE *fopen_fake(const char *filename, const char *mode) {
-  FILE *f = fopen(filename, mode);
+  const char *resolved = resolve_android_path(filename);
+  FILE *f = fopen(resolved, mode);
   if (!f)
-    debugPrintf("fopen(\"%s\", \"%s\") = NULL (errno=%d: %s)\n",
-                filename, mode, errno, strerror(errno));
+    debugPrintf("fopen(\"%s\" -> \"%s\", \"%s\") = NULL (errno=%d: %s)\n",
+                filename, resolved, mode, errno, strerror(errno));
   else
-    debugPrintf("fopen(\"%s\", \"%s\") = %p\n", filename, mode, f);
+    debugPrintf("fopen(\"%s\" -> \"%s\", \"%s\") = %p\n",
+                filename, resolved, mode, f);
   return f;
 }
 
-/* pthread wrappers (bionic struct sizes differ from glibc) */
-int pthread_mutex_init_fake(pthread_mutex_t **uid, const int *mutexattr) {
+/* pthread wrappers: guest code passes inline bionic objects by address. */
+int pthread_mutex_init_fake(pthread_mutex_t *uid, const int *mutexattr) {
   (void)mutexattr;
-  pthread_mutex_t *m = calloc(1, sizeof(pthread_mutex_t));
-  if (!m) return -1;
-  pthread_mutexattr_t attr;
-  pthread_mutexattr_init(&attr);
-  pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
-  int ret = pthread_mutex_init(m, &attr);
-  pthread_mutexattr_destroy(&attr);
-  if (ret < 0) { free(m); return -1; }
-  *uid = m;
-  return 0;
+  return lookup_host_mutex(uid, 1) ? 0 : -1;
 }
 
-int pthread_mutex_destroy_fake(pthread_mutex_t **uid) {
-  if (uid && *uid && (uintptr_t)*uid > 0x8000) {
-    pthread_mutex_destroy(*uid);
-    free(*uid);
-    *uid = NULL;
-  }
-  return 0;
+int pthread_mutex_destroy_fake(pthread_mutex_t *uid) {
+  return destroy_host_mutex(uid);
 }
 
-int pthread_mutex_lock_fake(pthread_mutex_t **uid) {
-  if (!*uid) pthread_mutex_init_fake(uid, NULL);
-  else if ((uintptr_t)*uid == 0x4000) {
-    int attr = 1;
-    pthread_mutex_init_fake(uid, &attr);
-  }
-  int ret = pthread_mutex_lock(*uid);
-  if (ret == 0) egl_shim_on_mutex_post_lock((void *)uid);
+int pthread_mutex_lock_fake(pthread_mutex_t *uid) {
+  pthread_mutex_t *host = lookup_host_mutex(uid, 1);
+  if (!host)
+    return -1;
+  int ret = pthread_mutex_lock(host);
+  if (ret == 0) egl_shim_on_mutex_post_lock(uid);
   return ret;
 }
 
-int pthread_mutex_trylock_fake(pthread_mutex_t **uid) {
-  if (!*uid) pthread_mutex_init_fake(uid, NULL);
-  else if ((uintptr_t)*uid == 0x4000) {
-    int attr = 1;
-    pthread_mutex_init_fake(uid, &attr);
-  }
-  int ret = pthread_mutex_trylock(*uid);
-  if (ret == 0) egl_shim_on_mutex_post_lock((void *)uid);
+int pthread_mutex_trylock_fake(pthread_mutex_t *uid) {
+  pthread_mutex_t *host = lookup_host_mutex(uid, 1);
+  if (!host)
+    return -1;
+  int ret = pthread_mutex_trylock(host);
+  if (ret == 0) egl_shim_on_mutex_post_lock(uid);
   return ret;
 }
 
-int pthread_mutex_unlock_fake(pthread_mutex_t **uid) {
-  if (!*uid) pthread_mutex_init_fake(uid, NULL);
-  else if ((uintptr_t)*uid == 0x4000) {
-    int attr = 1;
-    pthread_mutex_init_fake(uid, &attr);
-  }
-  egl_shim_on_mutex_pre_unlock((void *)uid);
-  return pthread_mutex_unlock(*uid);
+int pthread_mutex_unlock_fake(pthread_mutex_t *uid) {
+  pthread_mutex_t *host = lookup_host_mutex(uid, 1);
+  if (!host)
+    return -1;
+  egl_shim_on_mutex_pre_unlock(uid);
+  return pthread_mutex_unlock(host);
 }
 
-int pthread_cond_init_fake(pthread_cond_t **cnd, const int *condattr) {
+int pthread_cond_init_fake(pthread_cond_t *cnd, const int *condattr) {
   (void)condattr;
-  pthread_cond_t *c = calloc(1, sizeof(pthread_cond_t));
-  if (!c) return -1;
-  if (pthread_cond_init(c, NULL) < 0) { free(c); return -1; }
-  *cnd = c;
-  return 0;
+  return lookup_host_cond(cnd, 1) ? 0 : -1;
 }
 
-int pthread_cond_destroy_fake(pthread_cond_t **cnd) {
-  if (cnd && *cnd) {
-    pthread_cond_destroy(*cnd);
-    free(*cnd);
-    *cnd = NULL;
-  }
-  return 0;
+int pthread_cond_destroy_fake(pthread_cond_t *cnd) {
+  return destroy_host_cond(cnd);
 }
 
-int pthread_cond_wait_fake(pthread_cond_t **cnd, pthread_mutex_t **mtx) {
-  if (!*cnd) pthread_cond_init_fake(cnd, NULL);
-  return pthread_cond_wait(*cnd, *mtx);
+int pthread_cond_wait_fake(pthread_cond_t *cnd, pthread_mutex_t *mtx) {
+  pthread_cond_t *host_cnd = lookup_host_cond(cnd, 1);
+  pthread_mutex_t *host_mtx = lookup_host_mutex(mtx, 1);
+  if (!host_cnd || !host_mtx)
+    return -1;
+  return pthread_cond_wait(host_cnd, host_mtx);
 }
 
-int pthread_cond_timedwait_fake(pthread_cond_t **cnd, pthread_mutex_t **mtx,
+int pthread_cond_timedwait_fake(pthread_cond_t *cnd, pthread_mutex_t *mtx,
                                  const struct timespec *t) {
-  if (!*cnd) pthread_cond_init_fake(cnd, NULL);
-  return pthread_cond_timedwait(*cnd, *mtx, t);
+  pthread_cond_t *host_cnd = lookup_host_cond(cnd, 1);
+  pthread_mutex_t *host_mtx = lookup_host_mutex(mtx, 1);
+  if (!host_cnd || !host_mtx)
+    return -1;
+  return pthread_cond_timedwait(host_cnd, host_mtx, t);
 }
 
-int pthread_cond_signal_fake(pthread_cond_t **cnd) {
-  if (!*cnd) pthread_cond_init_fake(cnd, NULL);
-  return pthread_cond_signal(*cnd);
+int pthread_cond_signal_fake(pthread_cond_t *cnd) {
+  pthread_cond_t *host_cnd = lookup_host_cond(cnd, 1);
+  if (!host_cnd)
+    return -1;
+  return pthread_cond_signal(host_cnd);
 }
 
-int pthread_cond_broadcast_fake(pthread_cond_t **cnd) {
-  if (!*cnd) pthread_cond_init_fake(cnd, NULL);
-  return pthread_cond_broadcast(*cnd);
+int pthread_cond_broadcast_fake(pthread_cond_t *cnd) {
+  pthread_cond_t *host_cnd = lookup_host_cond(cnd, 1);
+  if (!host_cnd)
+    return -1;
+  return pthread_cond_broadcast(host_cnd);
 }
 
 typedef struct {
@@ -350,30 +472,47 @@ int pthread_create_fake(pthread_t *thread, const void *attr, void *entry,
   return ret;
 }
 
+static void *pthread_getspecific_fake(pthread_key_t key) {
+  (void)key;
+  return pthread_getspecific(key);
+}
+
+static int pthread_setspecific_fake(pthread_key_t key, const void *value) {
+  return pthread_setspecific(key, value);
+}
+
 int pthread_once_fake(volatile int *once_control, void (*init_routine)(void)) {
-  if (!once_control || !init_routine) return -1;
-  if (__sync_lock_test_and_set(once_control, 1) == 0)
-    (*init_routine)();
-  return 0;
+  return pthread_once((pthread_once_t *)once_control, init_routine);
 }
 
 /* GL logging wrappers — diagnose if game makes any GL calls after MakeCurrent */
+typedef const GLubyte *(*PFNGLGETSTRINGIPROC)(GLenum name, GLuint index);
+
 static const GLubyte *glGetString_wrap(GLenum name) {
   switch (name) {
   case 0x1f00: /* GL_VENDOR */
-    debugPrintf("GL: glGetString(GL_VENDOR)\n");
-    return (const GLubyte *)"Imagination Technologies";
   case 0x1f01: /* GL_RENDERER */
-    debugPrintf("GL: glGetString(GL_RENDERER)\n");
-    return (const GLubyte *)"PowerVR Rogue GE8300";
-  case 0x1f02: /* GL_VERSION — game expects GLES2 */
-    debugPrintf("GL: glGetString(GL_VERSION)\n");
-    return (const GLubyte *)"OpenGL ES 2.0";
-  case 0x8b8c: /* GL_SHADING_LANGUAGE_VERSION */
-    debugPrintf("GL: glGetString(GL_SHADING_LANGUAGE_VERSION)\n");
-    return (const GLubyte *)"OpenGL ES GLSL ES 1.00";
+  case 0x1f02: /* GL_VERSION */
+  case 0x8b8c: /* GL_SHADING_LANGUAGE_VERSION */ {
+    const GLubyte *s = glGetString(name);
+    debugPrintf("GL: glGetString(0x%x) = \"%s\"\n", name,
+                s ? (const char *)s : "(null)");
+    if (s)
+      return s;
+
+    switch (name) {
+    case 0x1f00:
+      return (const GLubyte *)"Imagination Technologies";
+    case 0x1f01:
+      return (const GLubyte *)"PowerVR Rogue GE8300";
+    case 0x1f02:
+      return (const GLubyte *)"OpenGL ES 2.0";
+    default:
+      return (const GLubyte *)"OpenGL ES GLSL ES 1.00";
+    }
+  }
   case 0x1f03: { /* GL_EXTENSIONS */
-    static const GLubyte ext[] =
+    static const GLubyte fallback_ext[] =
         "GL_OES_depth_texture "
         "GL_OES_depth24 "
         "GL_OES_packed_depth_stencil "
@@ -385,8 +524,61 @@ static const GLubyte *glGetString_wrap(GLenum name) {
         "GL_EXT_texture_format_BGRA8888 "
         "GL_IMG_texture_compression_pvrtc "
         "GL_OES_compressed_ETC1_RGB8_texture";
-    debugPrintf("GL: glGetString(GL_EXTENSIONS) -> %zu bytes\n", sizeof(ext) - 1);
-    return ext;
+    static GLubyte *ext_cache = NULL;
+    static size_t ext_cache_size = 0;
+
+    const GLubyte *ext = glGetString(name);
+    if (ext && ext[0] != '\0') {
+      debugPrintf("GL: glGetString(GL_EXTENSIONS) -> driver string (%zu bytes)\n",
+                  strlen((const char *)ext));
+      return ext;
+    }
+
+    PFNGLGETSTRINGIPROC glGetStringiProc =
+        (PFNGLGETSTRINGIPROC)SDL_GL_GetProcAddress("glGetStringi");
+    if (glGetStringiProc) {
+      GLint ext_count = 0;
+      glGetIntegerv(0x821D, &ext_count); /* GL_NUM_EXTENSIONS */
+      if (ext_count > 0) {
+        size_t needed = 1;
+        for (GLint i = 0; i < ext_count; i++) {
+          const GLubyte *item = glGetStringiProc(name, (GLuint)i);
+          if (item && item[0] != '\0')
+            needed += strlen((const char *)item) + 1;
+        }
+        if (needed > 1) {
+          GLubyte *buf = realloc(ext_cache, needed);
+          if (buf) {
+            ext_cache = buf;
+            ext_cache_size = needed;
+            size_t pos = 0;
+            ext_cache[0] = '\0';
+            for (GLint i = 0; i < ext_count; i++) {
+              const GLubyte *item = glGetStringiProc(name, (GLuint)i);
+              if (!item || item[0] == '\0')
+                continue;
+              size_t len = strlen((const char *)item);
+              if (pos + len + 1 >= ext_cache_size)
+                break;
+              memcpy(ext_cache + pos, item, len);
+              pos += len;
+              ext_cache[pos++] = ' ';
+            }
+            if (pos > 0)
+              pos--;
+            ext_cache[pos] = '\0';
+            debugPrintf(
+                "GL: glGetString(GL_EXTENSIONS) -> rebuilt from glGetStringi (%d entries, %zu bytes)\n",
+                ext_count, pos);
+            return ext_cache;
+          }
+        }
+      }
+    }
+
+    debugPrintf("GL: glGetString(GL_EXTENSIONS) -> fallback list (%zu bytes)\n",
+                sizeof(fallback_ext) - 1);
+    return fallback_ext;
   }
   default: {
     const GLubyte *s = glGetString(name);
@@ -402,40 +594,292 @@ static void glGetIntegerv_wrap(GLenum pname, GLint *data) {
 }
 
 static void glFrontFace_wrap(GLenum mode) {
+  egl_shim_ensure_current();
   debugPrintf("GL: glFrontFace(0x%x)\n", mode);
   glFrontFace(mode);
 }
 
 static GLuint glCreateShader_wrap(GLenum type) {
+  egl_shim_ensure_current();
   GLuint s = glCreateShader(type);
   debugPrintf("GL: glCreateShader(0x%x) = %u\n", type, s);
   return s;
 }
 
 static GLuint glCreateProgram_wrap(void) {
+  egl_shim_ensure_current();
   GLuint p = glCreateProgram();
   debugPrintf("GL: glCreateProgram() = %u\n", p);
   return p;
 }
 
 static void glGenTextures_wrap(GLsizei n, GLuint *textures) {
+  egl_shim_ensure_current();
   glGenTextures(n, textures);
   debugPrintf("GL: glGenTextures(%d) = %u\n", n, textures ? textures[0] : 0);
 }
 
 static void glGenFramebuffers_wrap(GLsizei n, GLuint *framebuffers) {
+  egl_shim_ensure_current();
   glGenFramebuffers(n, framebuffers);
   debugPrintf("GL: glGenFramebuffers(%d) = %u\n", n, framebuffers ? framebuffers[0] : 0);
 }
 
 static void glGenBuffers_wrap(GLsizei n, GLuint *buffers) {
+  egl_shim_ensure_current();
   glGenBuffers(n, buffers);
   debugPrintf("GL: glGenBuffers(%d) = %u\n", n, buffers ? buffers[0] : 0);
 }
 
 static void glBindFramebuffer_wrap(GLenum target, GLuint framebuffer) {
+  egl_shim_ensure_current();
   debugPrintf("GL: glBindFramebuffer(0x%x, %u)\n", target, framebuffer);
   glBindFramebuffer(target, framebuffer);
+}
+
+static void glShaderSource_wrap(GLuint shader, GLsizei count,
+                                const GLchar *const *string,
+                                const GLint *length) {
+  egl_shim_ensure_current();
+  glShaderSource(shader, count, string, length);
+}
+
+static void glCompileShader_wrap(GLuint shader) {
+  egl_shim_ensure_current();
+  glCompileShader(shader);
+  GLint ok = 0;
+  glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
+  if (!ok) {
+    GLchar log[1024];
+    GLsizei len = 0;
+    glGetShaderInfoLog(shader, sizeof(log), &len, log);
+    debugPrintf("GL: glCompileShader(%u) FAILED: %.*s\n", shader, (int)len, log);
+  }
+}
+
+static void glAttachShader_wrap(GLuint program, GLuint shader) {
+  egl_shim_ensure_current();
+  glAttachShader(program, shader);
+}
+
+static void glLinkProgram_wrap(GLuint program) {
+  egl_shim_ensure_current();
+  glLinkProgram(program);
+  GLint ok = 0;
+  glGetProgramiv(program, GL_LINK_STATUS, &ok);
+  if (!ok) {
+    GLchar log[1024];
+    GLsizei len = 0;
+    glGetProgramInfoLog(program, sizeof(log), &len, log);
+    debugPrintf("GL: glLinkProgram(%u) FAILED: %.*s\n", program, (int)len, log);
+  }
+}
+
+static void glBindBuffer_wrap(GLenum target, GLuint buffer) {
+  egl_shim_ensure_current();
+  glBindBuffer(target, buffer);
+}
+
+static void glBufferData_wrap(GLenum target, GLsizeiptr size, const void *data,
+                              GLenum usage) {
+  egl_shim_ensure_current();
+  glBufferData(target, size, data, usage);
+}
+
+static void glBufferSubData_wrap(GLenum target, GLintptr offset, GLsizeiptr size,
+                                 const void *data) {
+  egl_shim_ensure_current();
+  glBufferSubData(target, offset, size, data);
+}
+
+static void glBindTexture_wrap(GLenum target, GLuint texture) {
+  egl_shim_ensure_current();
+  glBindTexture(target, texture);
+}
+
+static void glTexImage2D_wrap(GLenum target, GLint level, GLint internalformat,
+                              GLsizei width, GLsizei height, GLint border,
+                              GLenum format, GLenum type, const void *pixels) {
+  egl_shim_ensure_current();
+  glTexImage2D(target, level, internalformat, width, height, border, format, type,
+               pixels);
+}
+
+static void glTexParameteri_wrap(GLenum target, GLenum pname, GLint param) {
+  egl_shim_ensure_current();
+  glTexParameteri(target, pname, param);
+}
+
+static void glUseProgram_wrap(GLuint program) {
+  egl_shim_ensure_current();
+  static _Thread_local GLuint last_program = UINT32_MAX;
+  if (program != last_program) {
+    debugPrintf("GL: glUseProgram(%u)\n", program);
+  }
+  last_program = program;
+  glUseProgram(program);
+}
+
+static void glUniform1f_wrap(GLint location, GLfloat v0) {
+  egl_shim_ensure_current();
+  glUniform1f(location, v0);
+}
+
+static void glUniform2f_wrap(GLint location, GLfloat v0, GLfloat v1) {
+  egl_shim_ensure_current();
+  glUniform2f(location, v0, v1);
+}
+
+static void glUniform3f_wrap(GLint location, GLfloat v0, GLfloat v1,
+                             GLfloat v2) {
+  egl_shim_ensure_current();
+  glUniform3f(location, v0, v1, v2);
+}
+
+static void glUniform4f_wrap(GLint location, GLfloat v0, GLfloat v1,
+                             GLfloat v2, GLfloat v3) {
+  egl_shim_ensure_current();
+  glUniform4f(location, v0, v1, v2, v3);
+}
+
+static void glUniform1i_wrap(GLint location, GLint v0) {
+  egl_shim_ensure_current();
+  glUniform1i(location, v0);
+}
+
+void glUniform1fv_wrap(GLint location, GLsizei count,
+                       const GLfloat *value) {
+  egl_shim_ensure_current();
+  glUniform1fv(location, count, value);
+}
+
+void glUniform2fv_wrap(GLint location, GLsizei count,
+                       const GLfloat *value) {
+  egl_shim_ensure_current();
+  glUniform2fv(location, count, value);
+}
+
+void glUniform3fv_wrap(GLint location, GLsizei count,
+                       const GLfloat *value) {
+  egl_shim_ensure_current();
+  glUniform3fv(location, count, value);
+}
+
+void glUniform4fv_wrap(GLint location, GLsizei count,
+                       const GLfloat *value) {
+  egl_shim_ensure_current();
+  glUniform4fv(location, count, value);
+}
+
+static void glUniform1iv_wrap(GLint location, GLsizei count,
+                              const GLint *value) {
+  egl_shim_ensure_current();
+  glUniform1iv(location, count, value);
+}
+
+static void glUniform2iv_wrap(GLint location, GLsizei count,
+                              const GLint *value) {
+  egl_shim_ensure_current();
+  glUniform2iv(location, count, value);
+}
+
+static void glUniform3iv_wrap(GLint location, GLsizei count,
+                              const GLint *value) {
+  egl_shim_ensure_current();
+  glUniform3iv(location, count, value);
+}
+
+static void glUniform4iv_wrap(GLint location, GLsizei count,
+                              const GLint *value) {
+  egl_shim_ensure_current();
+  glUniform4iv(location, count, value);
+}
+
+static void glUniformMatrix2fv_wrap(GLint location, GLsizei count,
+                                    GLboolean transpose,
+                                    const GLfloat *value) {
+  egl_shim_ensure_current();
+  glUniformMatrix2fv(location, count, transpose, value);
+}
+
+static void glUniformMatrix3fv_wrap(GLint location, GLsizei count,
+                                    GLboolean transpose,
+                                    const GLfloat *value) {
+  egl_shim_ensure_current();
+  glUniformMatrix3fv(location, count, transpose, value);
+}
+
+static void glUniformMatrix4fv_wrap(GLint location, GLsizei count,
+                                    GLboolean transpose,
+                                    const GLfloat *value) {
+  egl_shim_ensure_current();
+  glUniformMatrix4fv(location, count, transpose, value);
+}
+
+static GLenum glCheckFramebufferStatus_wrap(GLenum target) {
+  egl_shim_ensure_current();
+  GLenum status = glCheckFramebufferStatus(target);
+  static _Thread_local int fb_log_count = 0;
+  if (status != GL_FRAMEBUFFER_COMPLETE || fb_log_count < 12) {
+    debugPrintf("GL: glCheckFramebufferStatus(0x%x) = 0x%x\n", target, status);
+    fb_log_count++;
+  }
+  return status;
+}
+
+static void glClearColor_wrap(GLfloat red, GLfloat green, GLfloat blue,
+                              GLfloat alpha) {
+  egl_shim_ensure_current();
+  static _Thread_local int clear_color_log_count = 0;
+  if (clear_color_log_count < 12) {
+    debugPrintf("GL: glClearColor(%.3f, %.3f, %.3f, %.3f)\n",
+                red, green, blue, alpha);
+    clear_color_log_count++;
+  }
+  glClearColor(red, green, blue, alpha);
+}
+
+static void glClear_wrap(GLbitfield mask) {
+  egl_shim_ensure_current();
+  static _Thread_local int clear_log_count = 0;
+  if (clear_log_count < 20 || (mask & GL_COLOR_BUFFER_BIT) != 0) {
+    debugPrintf("GL: glClear(0x%x)\n", mask);
+    clear_log_count++;
+  }
+  glClear(mask);
+}
+
+static void glDrawArrays_wrap(GLenum mode, GLint first, GLsizei count) {
+  egl_shim_ensure_current();
+  static _Thread_local int draw_log_count = 0;
+  if (draw_log_count < 40 || draw_log_count % 200 == 0) {
+    debugPrintf("GL: glDrawArrays(0x%x, first=%d, count=%d)\n",
+                mode, first, count);
+  }
+  draw_log_count++;
+  glDrawArrays(mode, first, count);
+}
+
+static void glDrawElements_wrap(GLenum mode, GLsizei count, GLenum type,
+                                const void *indices) {
+  egl_shim_ensure_current();
+  static _Thread_local int draw_log_count = 0;
+  if (draw_log_count < 40 || draw_log_count % 200 == 0) {
+    debugPrintf("GL: glDrawElements(0x%x, count=%d, type=0x%x, indices=%p)\n",
+                mode, count, type, indices);
+  }
+  draw_log_count++;
+  glDrawElements(mode, count, type, indices);
+}
+
+static void glViewport_wrap(GLint x, GLint y, GLsizei width, GLsizei height) {
+  egl_shim_ensure_current();
+  static _Thread_local int viewport_log_count = 0;
+  if (viewport_log_count < 20) {
+    debugPrintf("GL: glViewport(%d, %d, %d, %d)\n", x, y, width, height);
+    viewport_log_count++;
+  }
+  glViewport(x, y, width, height);
 }
 
 /* Import table */
@@ -503,8 +947,8 @@ DynLibFunction dynlib_functions[] = {
     {"pthread_getschedparam", (uintptr_t)&ret0},
     {"pthread_key_create", (uintptr_t)&pthread_key_create},
     {"pthread_key_delete", (uintptr_t)&pthread_key_delete},
-    {"pthread_getspecific", (uintptr_t)&pthread_getspecific},
-    {"pthread_setspecific", (uintptr_t)&pthread_setspecific},
+    {"pthread_getspecific", (uintptr_t)&pthread_getspecific_fake},
+    {"pthread_setspecific", (uintptr_t)&pthread_setspecific_fake},
     {"sched_yield", (uintptr_t)&sched_yield},
 
     /* Memory */
@@ -699,19 +1143,19 @@ DynLibFunction dynlib_functions[] = {
 
     /* OpenGL ES 2.0 (direct passthrough) */
     {"glActiveTexture", (uintptr_t)&glActiveTexture},
-    {"glAttachShader", (uintptr_t)&glAttachShader},
+    {"glAttachShader", (uintptr_t)&glAttachShader_wrap},
     {"glBindAttribLocation", (uintptr_t)&glBindAttribLocation},
-    {"glBindBuffer", (uintptr_t)&glBindBuffer},
+    {"glBindBuffer", (uintptr_t)&glBindBuffer_wrap},
     {"glBindFramebuffer", (uintptr_t)&glBindFramebuffer_wrap},
-    {"glBindTexture", (uintptr_t)&glBindTexture},
+    {"glBindTexture", (uintptr_t)&glBindTexture_wrap},
     {"glBlendEquationSeparate", (uintptr_t)&glBlendEquationSeparate},
     {"glBlendFuncSeparate", (uintptr_t)&glBlendFuncSeparate},
-    {"glBufferData", (uintptr_t)&glBufferData},
-    {"glBufferSubData", (uintptr_t)&glBufferSubData},
-    {"glCheckFramebufferStatus", (uintptr_t)&glCheckFramebufferStatus},
-    {"glClear", (uintptr_t)&glClear},
-    {"glClearColor", (uintptr_t)&glClearColor},
-    {"glCompileShader", (uintptr_t)&glCompileShader},
+    {"glBufferData", (uintptr_t)&glBufferData_wrap},
+    {"glBufferSubData", (uintptr_t)&glBufferSubData_wrap},
+    {"glCheckFramebufferStatus", (uintptr_t)&glCheckFramebufferStatus_wrap},
+    {"glClear", (uintptr_t)&glClear_wrap},
+    {"glClearColor", (uintptr_t)&glClearColor_wrap},
+    {"glCompileShader", (uintptr_t)&glCompileShader_wrap},
     {"glCompressedTexImage2D", (uintptr_t)&glCompressedTexImage2D},
     {"glCopyTexImage2D", (uintptr_t)&glCopyTexImage2D},
     {"glCreateProgram", (uintptr_t)&glCreateProgram_wrap},
@@ -727,8 +1171,8 @@ DynLibFunction dynlib_functions[] = {
     {"glDepthMask", (uintptr_t)&glDepthMask},
     {"glDisable", (uintptr_t)&glDisable},
     {"glDisableVertexAttribArray", (uintptr_t)&glDisableVertexAttribArray},
-    {"glDrawArrays", (uintptr_t)&glDrawArrays},
-    {"glDrawElements", (uintptr_t)&glDrawElements},
+    {"glDrawArrays", (uintptr_t)&glDrawArrays_wrap},
+    {"glDrawElements", (uintptr_t)&glDrawElements_wrap},
     {"glEnable", (uintptr_t)&glEnable},
     {"glEnableVertexAttribArray", (uintptr_t)&glEnableVertexAttribArray},
     {"glFinish", (uintptr_t)&glFinish},
@@ -752,20 +1196,31 @@ DynLibFunction dynlib_functions[] = {
     {"glGetUniformLocation", (uintptr_t)&glGetUniformLocation},
     {"glGetVertexAttribPointerv", (uintptr_t)&glGetVertexAttribPointerv},
     {"glGetVertexAttribiv", (uintptr_t)&glGetVertexAttribiv},
-    {"glLinkProgram", (uintptr_t)&glLinkProgram},
+    {"glLinkProgram", (uintptr_t)&glLinkProgram_wrap},
     {"glReleaseShaderCompiler", (uintptr_t)&glReleaseShaderCompiler},
-    {"glShaderSource", (uintptr_t)&glShaderSource},
-    {"glTexImage2D", (uintptr_t)&glTexImage2D},
-    {"glTexParameteri", (uintptr_t)&glTexParameteri},
-    {"glUniform1fv", (uintptr_t)&glUniform1fv},
-    {"glUniform1i", (uintptr_t)&glUniform1i},
-    {"glUniform2fv", (uintptr_t)&glUniform2fv},
-    {"glUniform3fv", (uintptr_t)&glUniform3fv},
-    {"glUniform4fv", (uintptr_t)&glUniform4fv},
-    {"glUseProgram", (uintptr_t)&glUseProgram},
+    {"glShaderSource", (uintptr_t)&glShaderSource_wrap},
+    {"glTexImage2D", (uintptr_t)&glTexImage2D_wrap},
+    {"glTexParameteri", (uintptr_t)&glTexParameteri_wrap},
+    {"glUniform1f", (uintptr_t)&glUniform1f_wrap},
+    {"glUniform1fv", (uintptr_t)&glUniform1fv_wrap},
+    {"glUniform1i", (uintptr_t)&glUniform1i_wrap},
+    {"glUniform1iv", (uintptr_t)&glUniform1iv_wrap},
+    {"glUniform2f", (uintptr_t)&glUniform2f_wrap},
+    {"glUniform2fv", (uintptr_t)&glUniform2fv_wrap},
+    {"glUniform2iv", (uintptr_t)&glUniform2iv_wrap},
+    {"glUniform3f", (uintptr_t)&glUniform3f_wrap},
+    {"glUniform3fv", (uintptr_t)&glUniform3fv_wrap},
+    {"glUniform3iv", (uintptr_t)&glUniform3iv_wrap},
+    {"glUniform4f", (uintptr_t)&glUniform4f_wrap},
+    {"glUniform4fv", (uintptr_t)&glUniform4fv_wrap},
+    {"glUniform4iv", (uintptr_t)&glUniform4iv_wrap},
+    {"glUniformMatrix2fv", (uintptr_t)&glUniformMatrix2fv_wrap},
+    {"glUniformMatrix3fv", (uintptr_t)&glUniformMatrix3fv_wrap},
+    {"glUniformMatrix4fv", (uintptr_t)&glUniformMatrix4fv_wrap},
+    {"glUseProgram", (uintptr_t)&glUseProgram_wrap},
     {"glValidateProgram", (uintptr_t)&ret0},
     {"glVertexAttribPointer", (uintptr_t)&glVertexAttribPointer},
-    {"glViewport", (uintptr_t)&glViewport},
+    {"glViewport", (uintptr_t)&glViewport_wrap},
 
     /* OpenSL ES (our shim) */
     {"slCreateEngine", (uintptr_t)&slCreateEngine_shim},
