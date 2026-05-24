@@ -508,6 +508,7 @@ static void player_reset_meta(AudioPlayer *p) {
 /* Allocate a player */
 static AudioPlayer *alloc_player(void) {
   pthread_mutex_lock(&g_players_lock);
+  /* 1. Find inactive player */
   for (int i = 0; i < MAX_PLAYERS; i++) {
     if (!g_players[i].active) {
       AudioPlayer *p = &g_players[i];
@@ -517,6 +518,7 @@ static AudioPlayer *alloc_player(void) {
       return p;
     }
   }
+  /* 2. Recycle stopped + drained player */
   for (int i = 0; i < MAX_PLAYERS; i++) {
     AudioPlayer *p = &g_players[i];
     if (p->play_state == SL_PLAYSTATE_STOPPED &&
@@ -528,8 +530,43 @@ static AudioPlayer *alloc_player(void) {
       return p;
     }
   }
+  /* 3. Recycle any stopped player */
+  for (int i = 0; i < MAX_PLAYERS; i++) {
+    AudioPlayer *p = &g_players[i];
+    if (p->play_state == SL_PLAYSTATE_STOPPED) {
+      if (g_audio_dev) SDL_LockAudioDevice(g_audio_dev);
+      player_reset_meta(p);
+      if (g_audio_dev) SDL_UnlockAudioDevice(g_audio_dev);
+      pthread_mutex_unlock(&g_players_lock);
+      debugPrintf("opensles_shim: force-recycled stopped player %d\n", i);
+      return p;
+    }
+  }
+  /* 4. Force-kill oldest playing player (last resort) */
+  {
+    int oldest = -1;
+    uint64_t most_played = 0;
+    for (int i = 0; i < MAX_PLAYERS; i++) {
+      AudioPlayer *p = &g_players[i];
+      if (p->played_bytes >= most_played) {
+        most_played = p->played_bytes;
+        oldest = i;
+      }
+    }
+    if (oldest >= 0) {
+      AudioPlayer *p = &g_players[oldest];
+      debugPrintf("opensles_shim: WARNING: force-killing player %d (state=%u played=%llu)\n",
+                  oldest, p->play_state, (unsigned long long)p->played_bytes);
+      if (g_audio_dev) SDL_LockAudioDevice(g_audio_dev);
+      p->play_state = SL_PLAYSTATE_STOPPED;
+      player_reset_meta(p);
+      if (g_audio_dev) SDL_UnlockAudioDevice(g_audio_dev);
+      pthread_mutex_unlock(&g_players_lock);
+      return p;
+    }
+  }
   pthread_mutex_unlock(&g_players_lock);
-  debugPrintf("opensles_shim: WARNING: no free player slots!\n");
+  debugPrintf("opensles_shim: FATAL: no player slots at all!\n");
   return NULL;
 }
 
@@ -918,8 +955,9 @@ static SLresult engine_CreateAudioPlayer(void *self, void **pPlayer,
 
   AudioPlayer *p = alloc_player();
   if (!p) {
-    debugPrintf("opensles_shim: CreateAudioPlayer failed: no reusable player slots\n");
-    return SL_RESULT_SUCCESS;
+    debugPrintf("opensles_shim: CreateAudioPlayer FATAL: no player slots\n");
+    if (pPlayer) *pPlayer = NULL;
+    return SL_RESULT_RESOURCE_ERROR;
   }
 
   if (pAudioSrc) {

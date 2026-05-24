@@ -19,6 +19,7 @@ typedef uint32_t SLmillisecond;
 typedef uint32_t SLBoolean;
 
 #define SL_RESULT_SUCCESS ((SLresult)0x00000000)
+#define SL_RESULT_RESOURCE_ERROR ((SLresult)0x0000000D)
 #define SL_BOOLEAN_TRUE ((SLBoolean)0x00000001)
 #define SL_BOOLEAN_FALSE ((SLBoolean)0x00000000)
 
