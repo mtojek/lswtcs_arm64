@@ -458,7 +458,7 @@ static void maintain_primary_gamepad_mapping(void) {
         g_nupad_mapping[0].port = 1;
         g_nupad_mapping[0].is_active = 1;
         if (!g_nupad_mapping_logged) {
-            debugPrintf("Input: restored g_nupadMapping[0] -> {pad=0, port=1, is_active=1}\n");
+            /* debugPrintf("Input: restored g_nupadMapping[0] -> {pad=0, port=1, is_active=1}\n"); */
             g_nupad_mapping_logged = 1;
         }
     }
@@ -613,37 +613,37 @@ static uint8_t g_button_states[SDL_CONTROLLER_BUTTON_MAX];
 #define TRIGGER_THRESHOLD 16000
 
 static void send_native_key_down(void *env, int keycode, const char *source) {
-    debugPrintf("JNI input: nativeOnKeyDown(%d) source=%s\n", keycode, source);
+    /* debugPrintf("JNI input: nativeOnKeyDown(%d) source=%s\n", keycode, source); */
     activity.nativeOnKeyDown(env, ACTIVITY_CLASS, keycode);
 }
 
 static void send_native_key_up(void *env, int keycode, const char *source) {
-    debugPrintf("JNI input: nativeOnKeyUp(%d) source=%s\n", keycode, source);
+    /* debugPrintf("JNI input: nativeOnKeyUp(%d) source=%s\n", keycode, source); */
     activity.nativeOnKeyUp(env, ACTIVITY_CLASS, keycode);
 }
 
 static void send_native_touch_down(void *env, int pointer_id, float x, float y, const char *source) {
-    debugPrintf("JNI input: nativeOnTouchDown(id=%d, x=%.1f, y=%.1f) source=%s\n",
-                pointer_id, x, y, source);
+    /* debugPrintf("JNI input: nativeOnTouchDown(id=%d, x=%.1f, y=%.1f) source=%s\n",
+                pointer_id, x, y, source); */
     activity.nativeOnTouchDown(env, ACTIVITY_CLASS, pointer_id, pointer_id, x, y);
 }
 
 static void send_native_touch_move(void *env, int pointer_id, float x, float y, const char *source) {
-    debugPrintf("JNI input: nativeOnTouchMove(id=%d, x=%.1f, y=%.1f) source=%s\n",
-                pointer_id, x, y, source);
+    /* debugPrintf("JNI input: nativeOnTouchMove(id=%d, x=%.1f, y=%.1f) source=%s\n",
+                pointer_id, x, y, source); */
     activity.nativeOnTouchMove(env, ACTIVITY_CLASS, pointer_id, pointer_id, x, y);
 }
 
 static void send_native_touch_up(void *env, int pointer_id, const char *source) {
-    debugPrintf("JNI input: nativeOnTouchUp(id=%d) source=%s\n", pointer_id, source);
+    /* debugPrintf("JNI input: nativeOnTouchUp(id=%d) source=%s\n", pointer_id, source); */
     activity.nativeOnTouchUp(env, ACTIVITY_CLASS, pointer_id, pointer_id);
 }
 
 static void send_native_gamepad_axes(void *env, float hat_x, float hat_y,
                                      float lx, float ly, float rx, float ry,
                                      const char *source) {
-    debugPrintf("JNI input: nativeUpdateGamepadAxisValues hat(%.2f, %.2f) left(%.2f, %.2f) right(%.2f, %.2f) source=%s\n",
-                hat_x, hat_y, lx, ly, rx, ry, source);
+    /* debugPrintf("JNI input: nativeUpdateGamepadAxisValues hat(%.2f, %.2f) left(%.2f, %.2f) right(%.2f, %.2f) source=%s\n",
+                hat_x, hat_y, lx, ly, rx, ry, source); */
     activity.nativeUpdateGamepadAxisValues(env, ACTIVITY_CLASS, hat_x, hat_y, lx, ly, rx, ry);
 }
 
@@ -660,7 +660,7 @@ static void pump_gamepad_activation_pulse(void) {
     void *env = &g_jni_env;
 
     if (g_pending_activation_press) {
-        debugPrintf("Input: synthetic activation pulse DOWN\n");
+        /* debugPrintf("Input: synthetic activation pulse DOWN\n"); */
         send_native_key_down(env, AKEYCODE_BUTTON_A, "activation_pulse");
         g_pending_activation_press = 0;
         g_pending_activation_release = 3;
@@ -670,7 +670,7 @@ static void pump_gamepad_activation_pulse(void) {
     if (g_pending_activation_release > 0) {
         g_pending_activation_release--;
         if (g_pending_activation_release == 0) {
-            debugPrintf("Input: synthetic activation pulse UP\n");
+            /* debugPrintf("Input: synthetic activation pulse UP\n"); */
             send_native_key_up(env, AKEYCODE_BUTTON_A, "activation_pulse");
         }
     }
@@ -678,28 +678,28 @@ static void pump_gamepad_activation_pulse(void) {
 
 static void open_controller(void) {
     int num_joysticks = SDL_NumJoysticks();
-    debugPrintf("Input: SDL_NumJoysticks() = %d\n", num_joysticks);
+    /* debugPrintf("Input: SDL_NumJoysticks() = %d\n", num_joysticks); */
 
     for (int i = 0; i < num_joysticks; i++) {
         int is_controller = SDL_IsGameController(i);
-        const char *joy_name = SDL_JoystickNameForIndex(i);
+        /* const char *joy_name = SDL_JoystickNameForIndex(i);
         debugPrintf("Input: joystick[%d] name=%s gamecontroller=%d\n",
-                    i, joy_name ? joy_name : "(null)", is_controller);
+                    i, joy_name ? joy_name : "(null)", is_controller); */
         if (is_controller) {
             g_controller = SDL_GameControllerOpen(i);
             if (g_controller) {
                 memset(g_button_states, 0, sizeof(g_button_states));
-                debugPrintf("Controller opened: %s\n", SDL_GameControllerName(g_controller));
+                /* debugPrintf("Controller opened: %s\n", SDL_GameControllerName(g_controller)); */
                 queue_gamepad_activation_pulse();
                 return;
             } else {
-                debugPrintf("Input: SDL_GameControllerOpen(%d) failed: %s\n",
-                            i, SDL_GetError());
+                /* debugPrintf("Input: SDL_GameControllerOpen(%d) failed: %s\n",
+                            i, SDL_GetError()); */
             }
         }
     }
 
-    debugPrintf("Input: no SDL game controller opened\n");
+    /* debugPrintf("Input: no SDL game controller opened\n"); */
 }
 
 static void poll_controller_buttons(void) {
@@ -710,7 +710,7 @@ static void poll_controller_buttons(void) {
 
     if (guide_down != g_button_states[SDL_CONTROLLER_BUTTON_GUIDE]) {
         g_button_states[SDL_CONTROLLER_BUTTON_GUIDE] = guide_down;
-        debugPrintf("Input: guide/menu button %s\n", guide_down ? "DOWN" : "UP");
+        /* debugPrintf("Input: guide/menu button %s\n", guide_down ? "DOWN" : "UP"); */
         if (guide_down) {
             g_request_quit = 1;
         }
@@ -723,9 +723,9 @@ static void poll_controller_buttons(void) {
             continue;
 
         g_button_states[button] = down;
-        debugPrintf("Input: button %d -> keycode %d %s\n",
+        /* debugPrintf("Input: button %d -> keycode %d %s\n",
                     (int)button, button_map[i].android_keycode,
-                    down ? "DOWN" : "UP");
+                    down ? "DOWN" : "UP"); */
         if (down)
             send_native_key_down(env, button_map[i].android_keycode, "controller_button");
         else
@@ -769,8 +769,8 @@ static void poll_controller_axes(void) {
     if (hatX != g_last_hat_x || hatY != g_last_hat_y ||
         lx != g_last_lx || ly != g_last_ly ||
         rx != g_last_rx || ry != g_last_ry) {
-        debugPrintf("Input: axes hat(%.2f, %.2f) left(%.2f, %.2f) right(%.2f, %.2f)\n",
-                    hatX, hatY, lx, ly, rx, ry);
+        /* debugPrintf("Input: axes hat(%.2f, %.2f) left(%.2f, %.2f) right(%.2f, %.2f)\n",
+                    hatX, hatY, lx, ly, rx, ry); */
         send_native_gamepad_axes(env, hatX, hatY, lx, ly, rx, ry, "controller_axes");
         g_last_hat_x = hatX;
         g_last_hat_y = hatY;
@@ -784,8 +784,8 @@ static void poll_controller_axes(void) {
     int r2_down = raw_r2 > TRIGGER_THRESHOLD;
 
     if (l2_down != g_last_l2_down) {
-        debugPrintf("Input: trigger L2 %s (raw=%d)\n",
-                    l2_down ? "DOWN" : "UP", raw_l2);
+        /* debugPrintf("Input: trigger L2 %s (raw=%d)\n",
+                    l2_down ? "DOWN" : "UP", raw_l2); */
         if (l2_down)
             send_native_key_down(env, AKEYCODE_BUTTON_L2, "controller_l2");
         else
@@ -794,8 +794,8 @@ static void poll_controller_axes(void) {
     }
 
     if (r2_down != g_last_r2_down) {
-        debugPrintf("Input: trigger R2 %s (raw=%d)\n",
-                    r2_down ? "DOWN" : "UP", raw_r2);
+        /* debugPrintf("Input: trigger R2 %s (raw=%d)\n",
+                    r2_down ? "DOWN" : "UP", raw_r2); */
         if (r2_down)
             send_native_key_down(env, AKEYCODE_BUTTON_R2, "controller_r2");
         else
@@ -1015,7 +1015,7 @@ int main(int argc, char *argv[]) {
         opensles_shim_pump_callbacks();
 
         if (g_request_quit) {
-            debugPrintf("Input: guide/menu requested quit\n");
+            /* debugPrintf("Input: guide/menu requested quit\n"); */
             running = 0;
         }
 

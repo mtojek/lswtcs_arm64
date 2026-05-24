@@ -602,21 +602,21 @@ static void glFrontFace_wrap(GLenum mode) {
 static GLuint glCreateShader_wrap(GLenum type) {
   egl_shim_ensure_current();
   GLuint s = glCreateShader(type);
-  debugPrintf("GL: glCreateShader(0x%x) = %u\n", type, s);
+  /* debugPrintf("GL: glCreateShader(0x%x) = %u\n", type, s); */
   return s;
 }
 
 static GLuint glCreateProgram_wrap(void) {
   egl_shim_ensure_current();
   GLuint p = glCreateProgram();
-  debugPrintf("GL: glCreateProgram() = %u\n", p);
+  /* debugPrintf("GL: glCreateProgram() = %u\n", p); */
   return p;
 }
 
 static void glGenTextures_wrap(GLsizei n, GLuint *textures) {
   egl_shim_ensure_current();
   glGenTextures(n, textures);
-  debugPrintf("GL: glGenTextures(%d) = %u\n", n, textures ? textures[0] : 0);
+  /* debugPrintf("GL: glGenTextures(%d) = %u\n", n, textures ? textures[0] : 0); */
 }
 
 static void glGenFramebuffers_wrap(GLsizei n, GLuint *framebuffers) {
