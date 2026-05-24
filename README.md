@@ -6,6 +6,10 @@ Loads the original `libTTapp.so` from the Android APK and runs it natively on Li
 
 > **Status: PLAYABLE** — The game boots, renders, and is playable on Trimui Smart Pro with gamepad controls.
 
+## Screenshots
+
+<img src="screenshots/lsw-1.jpeg" width="50%"> <img src="screenshots/lsw-2.jpeg" width="50%">
+
 ## Requirements
 
 - Docker (for cross-compilation)
@@ -97,6 +101,7 @@ Gamepad with Nintendo face-button layout (A/B swapped to match Android gamepad s
 ## Known bugs
 
 - **Audio crackling** — Rare crackling when many SFX play simultaneously, mitigated by volume corruption guard and soft-clip limiter.
+- **No graceful exit** — The game has no quit option in its menus. Pressing the MENU button (guide) kills the process immediately.
 
 ## Disclaimer
 
