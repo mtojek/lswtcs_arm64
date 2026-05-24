@@ -201,8 +201,8 @@ EGLBoolean egl_shim_MakeCurrent(EGLDisplay dpy, EGLSurface draw,
     current_context = NULL;
     if (egl_window) {
       SDL_GL_MakeCurrent(egl_window, NULL);
-      debugPrintf("egl_shim: GL released [tid=%lx] reason=eglMakeCurrent(NULL)\n",
-                  (unsigned long)pthread_self());
+      /* debugPrintf("egl_shim: GL released [tid=%lx] reason=eglMakeCurrent(NULL)\n",
+                    (unsigned long)pthread_self()); */
     }
     has_real_gl = 0;
     return EGL_TRUE;

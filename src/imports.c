@@ -595,7 +595,7 @@ static void glGetIntegerv_wrap(GLenum pname, GLint *data) {
 
 static void glFrontFace_wrap(GLenum mode) {
   egl_shim_ensure_current();
-  debugPrintf("GL: glFrontFace(0x%x)\n", mode);
+  /* debugPrintf("GL: glFrontFace(0x%x)\n", mode); */
   glFrontFace(mode);
 }
 
@@ -633,7 +633,7 @@ static void glGenBuffers_wrap(GLsizei n, GLuint *buffers) {
 
 static void glBindFramebuffer_wrap(GLenum target, GLuint framebuffer) {
   egl_shim_ensure_current();
-  debugPrintf("GL: glBindFramebuffer(0x%x, %u)\n", target, framebuffer);
+  /* debugPrintf("GL: glBindFramebuffer(0x%x, %u)\n", target, framebuffer); */
   glBindFramebuffer(target, framebuffer);
 }
 
@@ -714,7 +714,7 @@ static void glUseProgram_wrap(GLuint program) {
   egl_shim_ensure_current();
   static _Thread_local GLuint last_program = UINT32_MAX;
   if (program != last_program) {
-    debugPrintf("GL: glUseProgram(%u)\n", program);
+    /* debugPrintf("GL: glUseProgram(%u)\n", program); */
   }
   last_program = program;
   glUseProgram(program);
@@ -841,11 +841,7 @@ static void glClearColor_wrap(GLfloat red, GLfloat green, GLfloat blue,
 
 static void glClear_wrap(GLbitfield mask) {
   egl_shim_ensure_current();
-  static _Thread_local int clear_log_count = 0;
-  if (clear_log_count < 20 || (mask & GL_COLOR_BUFFER_BIT) != 0) {
-    debugPrintf("GL: glClear(0x%x)\n", mask);
-    clear_log_count++;
-  }
+  /* debugPrintf("GL: glClear(0x%x)\n", mask); */
   glClear(mask);
 }
 
