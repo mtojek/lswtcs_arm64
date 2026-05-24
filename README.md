@@ -32,7 +32,6 @@ LSWTCS.pak/
 ├── launch.sh                  # launcher script (see below)
 ├── lswtcs_arm64               # compiled binary
 ├── libTTapp.so                # from APK lib/arm64-v8a/
-├── libpthread-2.33.so         # bionic pthread shim
 └── data/
     └── user/0/com.wb.lego.tcs/files/
         ├── assetpacks/
