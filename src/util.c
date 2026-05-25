@@ -5,6 +5,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "util.h"
@@ -42,9 +43,30 @@ uintptr_t read_tls_stack_guard(void) {
 const char *resolve_android_path(const char *path) {
   static _Thread_local char alt_path[2048];
   static _Thread_local char asset_path[2048];
+  static const char *app_data_prefix = "/data/user/0/com.wb.lego.tcs/";
+  static const char *legacy_sd_prefix = "mnt/sdcard/TTGames/com.ttfusion.legosaga/";
+  static const char *legacy_sd_prefix_abs = "/mnt/sdcard/TTGames/com.ttfusion.legosaga/";
 
   if (!path || path[0] == '\0')
     return path;
+
+  if (strncmp(path, legacy_sd_prefix, strlen(legacy_sd_prefix)) == 0) {
+    if (snprintf(alt_path, sizeof(alt_path), "./%s", path) < (int)sizeof(alt_path)) {
+      return alt_path;
+    }
+  }
+
+  if (strncmp(path, legacy_sd_prefix_abs, strlen(legacy_sd_prefix_abs)) == 0) {
+    if (snprintf(alt_path, sizeof(alt_path), ".%s", path) < (int)sizeof(alt_path)) {
+      return alt_path;
+    }
+  }
+
+  if (strncmp(path, app_data_prefix, strlen(app_data_prefix)) == 0) {
+    if (snprintf(alt_path, sizeof(alt_path), ".%s", path) < (int)sizeof(alt_path)) {
+      return alt_path;
+    }
+  }
 
   if (access(path, F_OK) == 0)
     return path;

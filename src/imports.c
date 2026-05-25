@@ -61,7 +61,6 @@ static HostMutexEntry *g_mutex_entries = NULL;
 static HostCondEntry *g_cond_entries = NULL;
 static pthread_mutex_t g_mutex_registry_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_cond_registry_lock = PTHREAD_MUTEX_INITIALIZER;
-
 /* Vita-style: just log and return — no abort, no loop */
 static void __stack_chk_fail_stub(void) {
   uintptr_t ra = (uintptr_t)__builtin_return_address(0);
@@ -270,15 +269,81 @@ int __open_2(const char *pathname, int flags) {
 /* open() wrapper for debugging — skip /dev/ spam */
 int open_fake(const char *pathname, int flags, ...) {
   const char *resolved = resolve_android_path(pathname);
-  int fd = open(resolved, flags);
+  int fd;
+  mode_t mode = 0;
+  int has_mode = 0;
+  if (flags & O_CREAT) {
+    va_list ap;
+    va_start(ap, flags);
+    mode = (mode_t)va_arg(ap, int);
+    va_end(ap);
+    has_mode = 1;
+    fd = open(resolved, flags, mode);
+  } else {
+    fd = open(resolved, flags);
+  }
   if (strncmp(pathname, "/dev/", 5) != 0) {
-    if (fd >= 0)
-      debugPrintf("open(\"%s\" -> \"%s\", 0x%x) = %d\n", pathname, resolved, flags, fd);
-    else
-      debugPrintf("open(\"%s\" -> \"%s\", 0x%x) = %d (errno=%d: %s)\n",
-                  pathname, resolved, flags, fd, errno, strerror(errno));
+    if (fd >= 0) {
+      if (has_mode)
+        debugPrintf("open(\"%s\" -> \"%s\", 0x%x, 0%o) = %d\n",
+                    pathname, resolved, flags, (unsigned)mode, fd);
+      else
+        debugPrintf("open(\"%s\" -> \"%s\", 0x%x) = %d\n",
+                    pathname, resolved, flags, fd);
+    } else {
+      if (has_mode)
+        debugPrintf("open(\"%s\" -> \"%s\", 0x%x, 0%o) = %d (errno=%d: %s)\n",
+                    pathname, resolved, flags, (unsigned)mode, fd, errno, strerror(errno));
+      else
+        debugPrintf("open(\"%s\" -> \"%s\", 0x%x) = %d (errno=%d: %s)\n",
+                    pathname, resolved, flags, fd, errno, strerror(errno));
+    }
   }
   return fd;
+}
+
+static int mkdir_fake(const char *pathname, mode_t mode) {
+  const char *resolved = resolve_android_path(pathname);
+  int ret = mkdir(resolved, mode);
+  if (ret == 0)
+    debugPrintf("mkdir(\"%s\" -> \"%s\", 0%o) = 0\n",
+                pathname, resolved, (unsigned)mode);
+  else
+    debugPrintf("mkdir(\"%s\" -> \"%s\", 0%o) = -1 (errno=%d: %s)\n",
+                pathname, resolved, (unsigned)mode, errno, strerror(errno));
+  return ret;
+}
+
+static int remove_fake(const char *pathname) {
+  const char *resolved = resolve_android_path(pathname);
+  int ret = remove(resolved);
+  if (ret == 0)
+    debugPrintf("remove(\"%s\" -> \"%s\") = 0\n", pathname, resolved);
+  else
+    debugPrintf("remove(\"%s\" -> \"%s\") = -1 (errno=%d: %s)\n",
+                pathname, resolved, errno, strerror(errno));
+  return ret;
+}
+
+static int rename_fake(const char *oldpath, const char *newpath) {
+  char resolved_old[2048];
+  char resolved_new[2048];
+  const char *resolved_old_src = resolve_android_path(oldpath);
+  const char *resolved_new_src;
+  int ret;
+
+  SDL_strlcpy(resolved_old, resolved_old_src, sizeof(resolved_old));
+  resolved_new_src = resolve_android_path(newpath);
+  SDL_strlcpy(resolved_new, resolved_new_src, sizeof(resolved_new));
+  ret = rename(resolved_old, resolved_new);
+  if (ret == 0) {
+    debugPrintf("rename(\"%s\" -> \"%s\", \"%s\" -> \"%s\") = 0\n",
+                oldpath, resolved_old, newpath, resolved_new);
+  } else {
+    debugPrintf("rename(\"%s\" -> \"%s\", \"%s\" -> \"%s\") = -1 (errno=%d: %s)\n",
+                oldpath, resolved_old, newpath, resolved_new, errno, strerror(errno));
+  }
+  return ret;
 }
 
 /* ctype compat */
@@ -353,13 +418,17 @@ int sigaction_fake(int signum, const void *act, void *oldact) {
 /* fopen wrapper for debugging */
 FILE *fopen_fake(const char *filename, const char *mode) {
   const char *resolved = resolve_android_path(filename);
-  FILE *f = fopen(resolved, mode);
-  if (!f)
+  FILE *f;
+
+  f = fopen(resolved, mode);
+  if (!f) {
     debugPrintf("fopen(\"%s\" -> \"%s\", \"%s\") = NULL (errno=%d: %s)\n",
                 filename, resolved, mode, errno, strerror(errno));
-  else
+  } else {
     debugPrintf("fopen(\"%s\" -> \"%s\", \"%s\") = %p\n",
                 filename, resolved, mode, f);
+  }
+
   return f;
 }
 
@@ -1058,10 +1127,10 @@ DynLibFunction dynlib_functions[] = {
     {"close", (uintptr_t)&close},
     {"read", (uintptr_t)&read},
     {"write", (uintptr_t)&write},
-    {"mkdir", (uintptr_t)&mkdir},
+    {"mkdir", (uintptr_t)&mkdir_fake},
     {"chdir", (uintptr_t)&chdir},
-    {"remove", (uintptr_t)&remove},
-    {"rename", (uintptr_t)&rename},
+    {"remove", (uintptr_t)&remove_fake},
+    {"rename", (uintptr_t)&rename_fake},
 
     /* stdlib */
     {"abort", (uintptr_t)&abort_fake},
