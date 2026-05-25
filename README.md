@@ -39,11 +39,10 @@ LSWTCS.pak/
         │   ├── asset_Levels/20202/20202/assets/Levels.dat
         │   ├── asset_Others/20202/20202/assets/Others.dat
         │   └── asset_Textures/20202/20202/assets/Textures.dat
+└── mnt/
+    └── sdcard/TTGames/com.ttfusion.legosaga/
+        ├── save.here
         └── SavedGames/
-            ├── SaveGame0.LEGO Star Wars - The Complete Saga_SavedGame.incomplete
-            ├── SaveGame1.LEGO Star Wars - The Complete Saga_SavedGame.incomplete
-            ├── SaveGame2.LEGO Star Wars - The Complete Saga_SavedGame.incomplete
-            ├── SaveGame3.LEGO Star Wars - The Complete Saga_SavedGame.incomplete
             ├── SaveGame0.LEGO Star Wars - The Complete Saga_SavedGame
             ├── SaveGame1.LEGO Star Wars - The Complete Saga_SavedGame
             ├── SaveGame2.LEGO Star Wars - The Complete Saga_SavedGame
@@ -52,7 +51,11 @@ LSWTCS.pak/
             └── SaveGame5.LEGO Star Wars - The Complete Saga_SavedGame
 ```
 
-The entire `data/` directory tree must be created manually. The `.dat` files come from the APK asset packs. All `SaveGame*` files must exist as **empty files** (0 bytes) — the game expects them on startup.
+The `data/` directory tree must be created manually. The `.dat` files come from the APK asset packs.
+
+Save files live in the legacy Android storage path under `mnt/sdcard/TTGames/com.ttfusion.legosaga/`. Create the `save.here` marker file and put normal `SaveGame*` files in `SavedGames/`.
+
+Do not pre-create `.incomplete` files. Those are temporary files created by the game during save and should not be part of the packaged layout.
 
 `launch.sh`:
 
